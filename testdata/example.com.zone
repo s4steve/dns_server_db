@@ -1,0 +1,29 @@
+$ORIGIN example.com.
+$TTL 300
+@         3600 IN SOA  ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+@         IN NS    ns1
+@         IN NS    ns2
+@         IN A     192.0.2.1
+@         IN MX    10 mail
+@         IN CAA   0 issue "letsencrypt.org"
+ns1       IN A     192.0.2.53
+ns2       IN AAAA  2001:db8::53
+www       IN A     192.0.2.10
+www       IN AAAA  2001:db8::10
+mail      IN A     192.0.2.25
+txt       IN TXT   "hello world"
+alias     IN CNAME www
+chain     IN CNAME alias
+loop1     IN CNAME loop2
+loop2     IN CNAME loop1
+dangling  IN CNAME nothere
+external  IN CNAME www.example.net.
+*.wild    IN A     192.0.2.99
+*.wild    IN TXT   "wildcard"
+host.wild IN A     192.0.2.98
+a.b.ent   IN A     192.0.2.77 ; b.ent and ent are empty non-terminals
+sub       IN NS    ns1.sub
+sub       IN NS    ns.other.net.
+ns1.sub   IN A     192.0.2.153
+deep.sub  IN A     192.0.2.154 ; occluded by the delegation, must never be served
+big       IN TXT   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

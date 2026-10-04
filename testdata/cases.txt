@@ -1,0 +1,177 @@
+# Golden answers. Format: see the `golden` test in src/main.rs.
+
+# Plain positive answers
+> www.example.com. A
+NOERROR aa
+ANSWER www.example.com. 300 IN A 192.0.2.10
+
+> WWW.Example.COM. AAAA
+NOERROR aa
+ANSWER www.example.com. 300 IN AAAA 2001:db8::10
+
+> example.com. NS
+NOERROR aa
+ANSWER example.com. 300 IN NS ns1.example.com.
+ANSWER example.com. 300 IN NS ns2.example.com.
+
+> example.com. SOA
+NOERROR aa
+ANSWER example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+> example.com. MX
+NOERROR aa
+ANSWER example.com. 300 IN MX 10 mail.example.com.
+
+> example.com. CAA
+NOERROR aa
+ANSWER example.com. 300 IN CAA 0 issue "letsencrypt.org"
+
+> txt.example.com. TXT
+NOERROR aa
+ANSWER txt.example.com. 300 IN TXT hello world
+
+# NODATA: name exists, type doesn't. SOA TTL = min(3600, MINIMUM 60).
+> mail.example.com. AAAA
+NOERROR aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# NXDOMAIN
+> nope.example.com. A
+NXDOMAIN aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+> deeper.nope.example.com. A
+NXDOMAIN aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# Empty non-terminals are NODATA, not NXDOMAIN (RFC 4592 / RFC 8020)
+> b.ent.example.com. A
+NOERROR aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+> ent.example.com. A
+NOERROR aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# ...and a missing name under an ENT is NXDOMAIN
+> zzz.b.ent.example.com. A
+NXDOMAIN aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# CNAME chains, chased inside our zones
+> alias.example.com. A
+NOERROR aa
+ANSWER alias.example.com. 300 IN CNAME www.example.com.
+ANSWER www.example.com. 300 IN A 192.0.2.10
+
+> chain.example.com. AAAA
+NOERROR aa
+ANSWER chain.example.com. 300 IN CNAME alias.example.com.
+ANSWER alias.example.com. 300 IN CNAME www.example.com.
+ANSWER www.example.com. 300 IN AAAA 2001:db8::10
+
+# Asking for the CNAME itself doesn't chase
+> alias.example.com. CNAME
+NOERROR aa
+ANSWER alias.example.com. 300 IN CNAME www.example.com.
+
+# CNAME to a missing name: NXDOMAIN applies to the target (RFC 6604)
+> dangling.example.com. A
+NXDOMAIN aa
+ANSWER dangling.example.com. 300 IN CNAME nothere.example.com.
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# CNAME leaving our zones: return the chain, the resolver follows it
+> external.example.com. A
+NOERROR aa
+ANSWER external.example.com. 300 IN CNAME www.example.net.
+
+# CNAME loop: stop where it repeats
+> loop1.example.com. A
+NOERROR aa
+ANSWER loop1.example.com. 300 IN CNAME loop2.example.com.
+ANSWER loop2.example.com. 300 IN CNAME loop1.example.com.
+
+# Cross-zone chase between two zones we host
+> to-www.other.test. A
+NOERROR aa
+ANSWER to-www.other.test. 600 IN CNAME www.example.com.
+ANSWER www.example.com. 300 IN A 192.0.2.10
+
+> to-nx.other.test. A
+NXDOMAIN aa
+ANSWER to-nx.other.test. 600 IN CNAME missing.example.com.
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# Wildcards (RFC 4592)
+> anything.wild.example.com. A
+NOERROR aa
+ANSWER anything.wild.example.com. 300 IN A 192.0.2.99
+
+> anything.wild.example.com. TXT
+NOERROR aa
+ANSWER anything.wild.example.com. 300 IN TXT wildcard
+
+> a.b.c.wild.example.com. A
+NOERROR aa
+ANSWER a.b.c.wild.example.com. 300 IN A 192.0.2.99
+
+# Wildcard exists but not for this type: NODATA
+> anything.wild.example.com. MX
+NOERROR aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# An existing name blocks the wildcard, even for types it lacks
+> host.wild.example.com. A
+NOERROR aa
+ANSWER host.wild.example.com. 300 IN A 192.0.2.98
+
+> host.wild.example.com. TXT
+NOERROR aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# ...and so does a closer existing name: below host.wild, the encloser is host.wild, which has no wildcard
+> x.host.wild.example.com. A
+NXDOMAIN aa
+AUTHORITY example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 60
+
+# Delegation: referral with in-zone glue, not authoritative
+> sub.example.com. A
+NOERROR
+AUTHORITY sub.example.com. 300 IN NS ns1.sub.example.com.
+AUTHORITY sub.example.com. 300 IN NS ns.other.net.
+ADDITIONAL ns1.sub.example.com. 300 IN A 192.0.2.153
+
+# Data below the cut is occluded: still a referral
+> deep.sub.example.com. A
+NOERROR
+AUTHORITY sub.example.com. 300 IN NS ns1.sub.example.com.
+AUTHORITY sub.example.com. 300 IN NS ns.other.net.
+ADDITIONAL ns1.sub.example.com. 300 IN A 192.0.2.153
+
+# A hosted child zone answers for itself; reloading the parent never touches it
+> x.child.example.com. A
+NOERROR aa
+ANSWER x.child.example.com. 300 IN A 192.0.2.200
+
+> nope.child.example.com. A
+NXDOMAIN aa
+AUTHORITY child.example.com. 30 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 900 1209600 30
+
+# Not our zone
+> www.example.org. A
+REFUSED
+
+# Truncation: ~650 bytes (AA is kept on the truncated header) doesn't fit plain UDP (512)...
+> big.example.com. TXT noedns
+NOERROR aa tc
+
+# ...fits with EDNS 1232...
+> big.example.com. TXT
+NOERROR aa
+ANSWER big.example.com. 300 IN TXT bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+# ...and the TCP retry gets it all, without EDNS
+> big.example.com. TXT tcp noedns
+NOERROR aa
+ANSWER big.example.com. 300 IN TXT bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
