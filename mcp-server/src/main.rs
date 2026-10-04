@@ -1,6 +1,7 @@
 //! MCP server for the DNS control plane, over stdio.
 //!
-//! A thin client of the REST API (`CONTROL_PLANE_URL`, default http://127.0.0.1:8053): each
+//! A thin client of the REST API (`CONTROL_PLANE_URL`, default http://127.0.0.1:8053, with
+//! the bearer token in `CONTROL_PLANE_TOKEN`; the token's grants decide what tools can do): each
 //! tool is one HTTP call, and all validation stays in the API. When the API rejects a
 //! change, the tool result is an error carrying the API's messages, so the model can fix
 //! the request and retry.
@@ -130,7 +131,7 @@ fn tools() -> Value {
         {
             "name": "get_changelog",
             "title": "Read changelog",
-            "description": "Read changelog entries after a sequence number, oldest first. Each entry has the zone, its new serial, and the complete new record set of every name it touched.",
+            "description": "Read changelog entries after a sequence number, oldest first, for the zones this token can see. Each entry has the zone, its new serial, the token that made the change (actor), and the complete new record set of every name it touched. Continue from next_after.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -141,22 +142,31 @@ fn tools() -> Value {
             },
             "annotations": read_only,
         },
+        {
+            "name": "whoami",
+            "title": "Show my permissions",
+            "description": "Show this server's API token: its name, whether it is an admin, and its grants (zone pattern, role viewer/editor/owner, and whether it may write LUA scripts). Check this before changing zones.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": read_only,
+        },
     ])
 }
 
 struct Api {
     base: String,
+    token: Option<String>,
     agent: ureq::Agent,
 }
 
 impl Api {
-    fn new(base: &str) -> Self {
+    fn new(base: &str, token: Option<String>) -> Self {
         // 4xx responses carry the API's validation messages; read them instead of failing.
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .build();
         Self {
             base: base.trim_end_matches('/').to_string(),
+            token,
             agent: config.into(),
         }
     }
@@ -164,11 +174,28 @@ impl Api {
     /// One API call. `Err` holds a message for the model: the API's errors, or why the call failed.
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
         let url = format!("{}{path}", self.base);
+        let auth = self
+            .token
+            .as_ref()
+            .map(|t| format!("Bearer {t}"))
+            .unwrap_or_default();
         let sent = match (method, body) {
-            ("GET", _) => self.agent.get(&url).call(),
-            ("DELETE", _) => self.agent.delete(&url).call(),
-            ("POST", Some(b)) => self.agent.post(&url).send_json(b),
-            ("PATCH", Some(b)) => self.agent.patch(&url).send_json(b),
+            ("GET", _) => self.agent.get(&url).header("Authorization", &auth).call(),
+            ("DELETE", _) => self
+                .agent
+                .delete(&url)
+                .header("Authorization", &auth)
+                .call(),
+            ("POST", Some(b)) => self
+                .agent
+                .post(&url)
+                .header("Authorization", &auth)
+                .send_json(b),
+            ("PATCH", Some(b)) => self
+                .agent
+                .patch(&url)
+                .header("Authorization", &auth)
+                .send_json(b),
             _ => unreachable!("{method} {path}"),
         };
         let mut resp =
@@ -213,6 +240,7 @@ fn call_tool(api: &Api, name: &str, args: &Value) -> Option<Result<Value, String
     let with_zone = |f: &dyn Fn(String) -> Result<Value, String>| zone_arg(args).and_then(f);
     Some(match name {
         "list_zones" => api.call("GET", "/zones", None),
+        "whoami" => api.call("GET", "/whoami", None),
         "get_zone" => with_zone(&|z| api.call("GET", &format!("/zones/{z}"), None)),
         "create_zone" => api.call("POST", "/zones", Some(args)),
         "update_zone" => with_zone(&|z| {
@@ -288,7 +316,13 @@ fn main() {
     let base =
         std::env::var("CONTROL_PLANE_URL").unwrap_or_else(|_| "http://127.0.0.1:8053".into());
     eprintln!("dns-server-db MCP server: control plane {base}");
-    let api = Api::new(&base);
+    let token = std::env::var("CONTROL_PLANE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if token.is_none() {
+        eprintln!("warning: CONTROL_PLANE_TOKEN is not set; the API will refuse every call");
+    }
+    let api = Api::new(&base, token);
     let mut out = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };

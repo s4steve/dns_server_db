@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -48,6 +48,39 @@ pub struct Rec {
     pub rtype: String,
     pub ttl: u32,
     pub data: String,
+}
+
+/// The control plane's bearer token, from `CONTROL_PLANE_TOKEN` (kept out of argv and `ps`).
+/// Nodes need a token with a `*:viewer` grant: read-only, every zone.
+fn token() -> Option<&'static str> {
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("CONTROL_PLANE_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
+        .as_deref()
+}
+
+/// GETs JSON from the control plane with the node's token, turning auth failures into
+/// messages that say what to fix.
+fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
+    let mut req = ureq::get(url);
+    if let Some(t) = token() {
+        req = req.header("Authorization", &format!("Bearer {t}"));
+    }
+    match req.call() {
+        Ok(mut resp) => Ok(resp.body_mut().read_json()?),
+        Err(ureq::Error::StatusCode(401)) => Err(
+            "control plane rejected the token (401): set CONTROL_PLANE_TOKEN to a valid token"
+                .into(),
+        ),
+        Err(ureq::Error::StatusCode(403)) => Err(
+            "control plane token can't read every zone (403): nodes need a '*:viewer' grant".into(),
+        ),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Polls forever. Meant for its own thread: LMDB writes and the HTTP client both block.
@@ -83,7 +116,7 @@ fn sync_once(store: &Store, control_plane: &str) -> Result<(bool, Vec<Name>)> {
     let after = store.get_meta(&txn, APPLIED_SEQ)?.unwrap_or(0);
     drop(txn);
     let url = format!("{control_plane}/changelog?after={after}&limit={PAGE}");
-    let page: Page = ureq::get(&url).call()?.body_mut().read_json()?;
+    let page: Page = get_json(&url)?;
     let caught_up = page.entries.len() < PAGE;
     apply(store, &page.entries, caught_up.then(store::now))?;
     let zones = page
@@ -225,10 +258,7 @@ impl Checks {
         };
         let is_due = |due: &HashMap<Name, Instant>, z: &Name| due.get(z).is_none_or(|t| *t <= now);
 
-        let remote: RemoteZones = match ureq::get(&format!("{control_plane}/zones"))
-            .call()
-            .and_then(|mut r| r.body_mut().read_json())
-        {
+        let remote: RemoteZones = match get_json(&format!("{control_plane}/zones")) {
             Ok(r) => r,
             Err(e) => {
                 for (zone, soa) in &local {
@@ -307,10 +337,7 @@ impl Checks {
 
 /// Replaces the local copy of `zone` with the control plane's current contents.
 fn refetch(store: &Store, control_plane: &str, zone: &Name) -> Result<()> {
-    let snap: Snapshot = ureq::get(&format!("{control_plane}/zones/{zone}"))
-        .call()?
-        .body_mut()
-        .read_json()?;
+    let snap: Snapshot = get_json(&format!("{control_plane}/zones/{zone}"))?;
     let s = &snap.soa;
     let soa = Rec {
         rtype: "SOA".into(),

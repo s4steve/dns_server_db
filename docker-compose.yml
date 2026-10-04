@@ -1,5 +1,11 @@
 # `docker compose up -d` starts Postgres only (for local development).
 # `docker compose --profile multinode up -d --build` adds the control plane and two DNS nodes.
+#
+# The tokens below are fixed, public, development-only secrets: never reuse them anywhere real.
+x-dev-tokens:
+  admin: &admin-token dnsdb_dev_admin_token_do_not_use_in_production
+  nodes: &nodes-token dnsdb_dev_nodes_token_do_not_use_in_production
+
 services:
   postgres:
     image: postgres:17
@@ -16,6 +22,22 @@ services:
       interval: 2s
       retries: 15
 
+  # One-shot: mints the dev admin token and the nodes' read-only token, if missing.
+  bootstrap:
+    profiles: [multinode]
+    build: .
+    entrypoint: ["sh", "-c"]
+    command:
+      - control-plane create-token --name dev-admin --admin --secret "$$ADMIN_TOKEN" --if-missing &&
+        control-plane create-token --name dev-nodes --grant '*:viewer' --secret "$$NODES_TOKEN" --if-missing
+    environment:
+      DATABASE_URL: postgres://dns:dns@postgres:5432/dns
+      ADMIN_TOKEN: *admin-token
+      NODES_TOKEN: *nodes-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   control-plane:
     profiles: [multinode]
     build: .
@@ -28,6 +50,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
 
   node1: &node
     profiles: [multinode]
@@ -38,6 +62,8 @@ services:
       - "127.0.0.1:5301:53/udp"
       - "127.0.0.1:5301:53/tcp"
       - "127.0.0.1:9301:9153"
+    environment:
+      CONTROL_PLANE_TOKEN: *nodes-token
     depends_on: [control-plane]
 
   node2:

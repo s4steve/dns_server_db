@@ -12,6 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 API=http://127.0.0.1:8054
+TOKEN=dnsdb_dev_admin_token_do_not_use_in_production # dev-only, see docker-compose.yml
 NODES=(5301 5302)
 ZONE="mn$(date +%s).test."
 EXPIRE=8
@@ -19,7 +20,7 @@ REFRESH=3
 RETRY=2
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-api() { curl -sf -H 'content-type: application/json' "$@"; }
+api() { curl -sf -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" "$@"; }
 ask() { dig @127.0.0.1 -p "$1" +norec +tries=1 +time=1 "$2" A; }
 status() { ask "$1" "$2" | sed -n 's/.*status: \([A-Z]*\).*/\1/p'; }
 answer() { dig @127.0.0.1 -p "$1" +norec +tries=1 +time=1 +short "$2" A; }
@@ -46,6 +47,10 @@ all_status() {
 echo "== starting postgres, control plane, node1, node2"
 docker compose --profile multinode up -d --build --wait
 wait_for 30 api "$API/zones" -o /dev/null >/dev/null || fail "control plane not reachable"
+
+status=$(curl -s -o /dev/null -w '%{http_code}' "$API/zones")
+[[ "$status" == 401 ]] || fail "unauthenticated request got $status, not 401"
+echo "== access control: no token -> 401; nodes authenticate with their read-only token"
 
 echo "== zone $ZONE (SOA refresh ${REFRESH}s, retry ${RETRY}s, expire ${EXPIRE}s)"
 api -X POST "$API/zones" -d "{\"name\":\"$ZONE\",\"ns\":[\"ns1.$ZONE\"],

@@ -1,10 +1,11 @@
 //! REST API. Every write is one transaction that validates the result, bumps the zone's
-//! SOA serial, and appends one changelog entry; nothing is half-applied.
+//! SOA serial, and appends one changelog entry; nothing is half-applied. Every request is
+//! authenticated and authorized per zone (see `auth.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgConnection, PgPool};
 
+use crate::auth::{self, Caller, Grant, Role};
 use crate::validate;
 
 // ponytail: one global lock serializes changelog inserts so seq order == commit order.
@@ -28,13 +30,19 @@ pub fn router(pool: PgPool) -> Router {
         )
         .route("/zones/{zone}/changes", post(apply_changes))
         .route("/changelog", get(changelog))
+        .route("/whoami", get(whoami))
+        .route("/tokens", get(list_tokens).post(create_token))
+        .route("/tokens/{name}", axum::routing::delete(revoke_token))
         .with_state(pool)
 }
 
 // ---------- errors ----------
 
+#[derive(Debug)]
 pub enum ApiError {
     BadRequest(Vec<String>),
+    Unauthorized(String),
+    Forbidden(String),
     NotFound(String),
     Conflict(String),
     Internal(String),
@@ -44,6 +52,16 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, errors) = match self {
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::Unauthorized(e) => {
+                let body = Json(json!({ "errors": [e] }));
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer")],
+                    body,
+                )
+                    .into_response();
+            }
+            ApiError::Forbidden(e) => (StatusCode::FORBIDDEN, vec![e]),
             ApiError::NotFound(e) => (StatusCode::NOT_FOUND, vec![e]),
             ApiError::Conflict(e) => (StatusCode::CONFLICT, vec![e]),
             ApiError::Internal(e) => {
@@ -134,6 +152,7 @@ async fn commit_change(
     db: &mut PgConnection,
     zone: &ZoneRow,
     mut names: BTreeSet<String>,
+    actor: &str,
 ) -> ApiResult<Value> {
     let zone: ZoneRow = sqlx::query_as(
         "UPDATE zones SET serial = (serial + 1) % 4294967296 WHERE id = $1
@@ -166,7 +185,15 @@ async fn commit_change(
             .push(json!({ "type": r.rtype, "ttl": r.ttl, "data": r.data }));
     }
 
-    append_changelog(db, &zone.name, Some(zone.serial), "names", json!(payload)).await
+    append_changelog(
+        db,
+        &zone.name,
+        Some(zone.serial),
+        "names",
+        json!(payload),
+        actor,
+    )
+    .await
 }
 
 async fn append_changelog(
@@ -175,18 +202,21 @@ async fn append_changelog(
     serial: Option<i64>,
     op: &str,
     payload: Value,
+    actor: &str,
 ) -> ApiResult<Value> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(CHANGELOG_LOCK)
         .execute(&mut *db)
         .await?;
     let seq: i64 = sqlx::query_scalar(
-        "INSERT INTO changelog (zone, serial, op, payload) VALUES ($1, $2, $3, $4) RETURNING seq",
+        "INSERT INTO changelog (zone, serial, op, payload, actor) VALUES ($1, $2, $3, $4, $5)
+         RETURNING seq",
     )
     .bind(zone)
     .bind(serial)
     .bind(op)
     .bind(payload)
+    .bind(actor)
     .fetch_one(&mut *db)
     .await?;
     Ok(json!({ "zone": zone, "seq": seq, "serial": serial }))
@@ -194,9 +224,10 @@ async fn append_changelog(
 
 // ---------- zones ----------
 
-/// All zones, plus `seq`: the changelog head in the same snapshot. A node whose applied seq
-/// equals `seq` can compare serials without a change in flight causing a false mismatch.
-async fn list_zones(State(pool): State<PgPool>) -> ApiResult<Json<Value>> {
+/// The zones the caller can see, plus `seq`: the changelog head in the same snapshot. A node
+/// whose applied seq equals `seq` can compare serials without a change in flight causing a
+/// false mismatch.
+async fn list_zones(caller: Caller, State(pool): State<PgPool>) -> ApiResult<Json<Value>> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
@@ -211,14 +242,22 @@ async fn list_zones(State(pool): State<PgPool>) -> ApiResult<Json<Value>> {
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    let visible = |z: &&ZoneRow| {
+        caller.sees_all() || validate::parse_zone(&z.name).is_ok_and(|n| caller.role(&n).is_some())
+    };
     Ok(Json(json!({
         "seq": seq,
-        "zones": zones.iter().map(ZoneRow::json).collect::<Vec<_>>(),
+        "zones": zones.iter().filter(visible).map(ZoneRow::json).collect::<Vec<_>>(),
     })))
 }
 
-async fn get_zone(State(pool): State<PgPool>, Path(zone): Path<String>) -> ApiResult<Json<Value>> {
+async fn get_zone(
+    caller: Caller,
+    State(pool): State<PgPool>,
+    Path(zone): Path<String>,
+) -> ApiResult<Json<Value>> {
     let zone = validate::parse_zone(&zone).map_err(bad)?;
+    caller.require(&zone, Role::Viewer)?;
     // One snapshot, so the serial always matches the records (nodes re-fetch from here).
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -301,10 +340,17 @@ fn check_soa(soa: &SoaFields) -> Result<(Option<String>, Option<String>), Vec<St
 }
 
 async fn create_zone(
+    caller: Caller,
     State(pool): State<PgPool>,
     Json(req): Json<CreateZone>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let zone = validate::parse_zone(&req.name).map_err(bad)?;
+    if caller.role(&zone) < Some(Role::Owner) {
+        return Err(ApiError::Forbidden(format!(
+            "token {:?} can't create zone {zone}: that needs owner on a pattern covering it",
+            caller.name
+        )));
+    }
     let mut errors = vec![];
     let (mname, rname) = check_soa(&req.soa).unwrap_or_else(|e| {
         errors.extend(e);
@@ -369,7 +415,7 @@ async fn create_zone(
     }
     // Serial starts at 0 so this first committed change makes it 1.
     let row = lock_zone(&mut tx, &zone).await?;
-    let result = commit_change(&mut tx, &row, BTreeSet::new()).await?;
+    let result = commit_change(&mut tx, &row, BTreeSet::new(), &caller.name).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -383,11 +429,13 @@ struct PatchZone {
 }
 
 async fn patch_zone(
+    caller: Caller,
     State(pool): State<PgPool>,
     Path(zone): Path<String>,
     Json(req): Json<PatchZone>,
 ) -> ApiResult<Json<Value>> {
     let zone = validate::parse_zone(&zone).map_err(bad)?;
+    caller.require(&zone, Role::Owner)?;
     let (mname, rname) = check_soa(&req.soa).map_err(ApiError::BadRequest)?;
     let default_ttl = req
         .default_ttl
@@ -414,23 +462,33 @@ async fn patch_zone(
     .bind(req.soa.minimum)
     .execute(&mut *tx)
     .await?;
-    let result = commit_change(&mut tx, &row, BTreeSet::new()).await?;
+    let result = commit_change(&mut tx, &row, BTreeSet::new(), &caller.name).await?;
     tx.commit().await?;
     Ok(Json(result))
 }
 
 async fn delete_zone(
+    caller: Caller,
     State(pool): State<PgPool>,
     Path(zone): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let zone = validate::parse_zone(&zone).map_err(bad)?;
+    caller.require(&zone, Role::Owner)?;
     let mut tx = pool.begin().await?;
     let row = lock_zone(&mut tx, &zone).await?;
     sqlx::query("DELETE FROM zones WHERE id = $1")
         .bind(row.id)
         .execute(&mut *tx)
         .await?;
-    let result = append_changelog(&mut tx, &row.name, None, "delete_zone", json!({})).await?;
+    let result = append_changelog(
+        &mut tx,
+        &row.name,
+        None,
+        "delete_zone",
+        json!({}),
+        &caller.name,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(result))
 }
@@ -507,11 +565,13 @@ fn parse_change(zone: &Name, change: &Change) -> Result<Parsed, String> {
 }
 
 async fn apply_changes(
+    caller: Caller,
     State(pool): State<PgPool>,
     Path(zone): Path<String>,
     Json(req): Json<ChangeSet>,
 ) -> ApiResult<Json<Value>> {
     let zone = validate::parse_zone(&zone).map_err(bad)?;
+    caller.require(&zone, Role::Editor)?;
     if req.changes.is_empty() {
         return Err(bad("changes: at least one change is required"));
     }
@@ -528,6 +588,15 @@ async fn apply_changes(
         .collect();
     if !errors.is_empty() {
         return Err(ApiError::BadRequest(errors));
+    }
+    let touches_scripts = parsed.iter().any(|p| match p {
+        Parsed::Add { rtype, .. } | Parsed::Delete { rtype, .. } => *rtype == validate::LUA,
+    });
+    if touches_scripts && !caller.can_script(&zone) {
+        return Err(ApiError::Forbidden(format!(
+            "token {:?} may not add or delete LUA records in {zone}: that needs the scripts grant",
+            caller.name
+        )));
     }
 
     let mut tx = pool.begin().await?;
@@ -628,7 +697,7 @@ async fn apply_changes(
     if !errors.is_empty() {
         return Err(ApiError::BadRequest(errors)); // tx drops -> rollback
     }
-    let result = commit_change(&mut tx, &row, touched).await?;
+    let result = commit_change(&mut tx, &row, touched, &caller.name).await?;
     tx.commit().await?;
     Ok(Json(result))
 }
@@ -642,25 +711,144 @@ struct ChangelogQuery {
     limit: Option<i64>,
 }
 
-/// Entries with seq > `after`, oldest first. Nodes poll this (Stage 3).
+/// Entries with seq > `after`, oldest first, for zones the caller can see. `next_after` is
+/// the last seq scanned: pass it as `after` to continue, even when filtering hid entries.
+/// Nodes poll this (Stage 3) with a token that sees every zone.
 async fn changelog(
+    caller: Caller,
     State(pool): State<PgPool>,
     Query(q): Query<ChangelogQuery>,
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.unwrap_or(1000).clamp(1, 10_000);
-    let rows: Vec<(i64, String, Option<i64>, String, Value, String)> = sqlx::query_as(
-        "SELECT seq, zone, serial, op, payload, created_at::text FROM changelog
+    let rows: Vec<(
+        i64,
+        String,
+        Option<i64>,
+        String,
+        Value,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT seq, zone, serial, op, payload, actor, created_at::text FROM changelog
          WHERE seq > $1 ORDER BY seq LIMIT $2",
     )
     .bind(q.after)
     .bind(limit)
     .fetch_all(&pool)
     .await?;
+    let next_after = rows.last().map_or(q.after, |r| r.0);
     let entries: Vec<Value> = rows
         .into_iter()
-        .map(|(seq, zone, serial, op, payload, created_at)| {
-            json!({ "seq": seq, "zone": zone, "serial": serial, "op": op, "payload": payload, "created_at": created_at })
+        .filter(|r| {
+            caller.sees_all() || validate::parse_zone(&r.1).is_ok_and(|z| caller.role(&z).is_some())
+        })
+        .map(|(seq, zone, serial, op, payload, actor, created_at)| {
+            json!({ "seq": seq, "zone": zone, "serial": serial, "op": op, "payload": payload,
+                    "actor": actor, "created_at": created_at })
         })
         .collect();
-    Ok(Json(json!({ "entries": entries })))
+    Ok(Json(
+        json!({ "entries": entries, "next_after": next_after }),
+    ))
+}
+
+// ---------- tokens ----------
+
+async fn whoami(caller: Caller) -> Json<Value> {
+    Json(json!({ "name": caller.name, "admin": caller.admin, "grants": caller.grants }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateToken {
+    name: String,
+    #[serde(default)]
+    admin: bool,
+    #[serde(default)]
+    grants: Vec<Grant>,
+    expires_in_days: Option<u32>,
+}
+
+async fn create_token(
+    caller: Caller,
+    State(pool): State<PgPool>,
+    Json(req): Json<CreateToken>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    caller.require_admin()?;
+    let grants = req
+        .grants
+        .iter()
+        .map(|g| Grant::new(&g.pattern, g.role, g.scripts))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(bad)?;
+    let secret = auth::create_token(
+        &pool,
+        &req.name,
+        req.admin,
+        &grants,
+        None,
+        req.expires_in_days,
+        false,
+    )
+    .await?
+    .expect("if_missing is false");
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "name": req.name, "token": secret, "grants": grants })),
+    ))
+}
+
+#[derive(FromRow)]
+struct TokenInfo {
+    id: i64,
+    name: String,
+    prefix: String,
+    admin: bool,
+    created_at: String,
+    last_used_at: Option<String>,
+    expires_at: Option<String>,
+    revoked_at: Option<String>,
+}
+
+/// Every token, without secrets.
+async fn list_tokens(caller: Caller, State(pool): State<PgPool>) -> ApiResult<Json<Value>> {
+    caller.require_admin()?;
+    let rows: Vec<TokenInfo> = sqlx::query_as(
+        "SELECT id, name, prefix, admin, created_at::text, last_used_at::text, expires_at::text,
+                revoked_at::text
+         FROM tokens ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let mut tokens = vec![];
+    for t in rows {
+        tokens.push(json!({
+            "name": t.name, "prefix": t.prefix, "admin": t.admin,
+            "grants": auth::load_grants(&pool, t.id).await?,
+            "created_at": t.created_at, "last_used_at": t.last_used_at,
+            "expires_at": t.expires_at, "revoked_at": t.revoked_at,
+        }));
+    }
+    Ok(Json(json!({ "tokens": tokens })))
+}
+
+/// Revokes a token. The row stays, so changelog actors keep naming a known token.
+async fn revoke_token(
+    caller: Caller,
+    State(pool): State<PgPool>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    caller.require_admin()?;
+    let revoked =
+        sqlx::query("UPDATE tokens SET revoked_at = now() WHERE name = $1 AND revoked_at IS NULL")
+            .bind(&name)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+    if revoked == 0 {
+        return Err(ApiError::NotFound(format!(
+            "no active token named {name:?}"
+        )));
+    }
+    Ok(Json(json!({ "revoked": name })))
 }
