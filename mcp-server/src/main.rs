@@ -1,0 +1,307 @@
+//! MCP server for the DNS control plane, over stdio.
+//!
+//! A thin client of the REST API (`CONTROL_PLANE_URL`, default http://127.0.0.1:8053): each
+//! tool is one HTTP call, and all validation stays in the API. When the API rejects a
+//! change, the tool result is an error carrying the API's messages, so the model can fix
+//! the request and retry.
+//!
+//! Protocol: JSON-RPC 2.0, one message per line on stdin/stdout (MCP stdio transport).
+//! Tools only. Logs go to stderr; stdout carries nothing but protocol messages.
+
+use std::io::{BufRead, Write};
+
+use serde_json::{Value, json};
+
+/// Newest first. We answer with the client's version if we know it, else our newest.
+const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+const LUA_HELP: &str = "LUA records: type \"LUA\", data \"<TYPE> <script>\" where TYPE is A, AAAA, TXT, MX or CAA. \
+The script runs per query and returns record data as a string or list of strings (nil = serve the static records). \
+It reads q.name, q.type, q.client (EDNS client subnet address, else source IP), q.client_prefix, q.source, q.node \
+and q.static, and can call in_cidr(ip, \"10.0.0.0/8\"). Example data: \
+\"A if in_cidr(q.client, '10.0.0.0/8') then return '192.0.2.10' end return '192.0.2.20'\".";
+
+fn tools() -> Value {
+    let zone = json!({ "type": "string", "description": "Zone name, e.g. \"example.com\"" });
+    let ttl = json!({ "type": "integer", "minimum": 0, "maximum": 2147483647 });
+    let soa = json!({
+        "type": "object",
+        "description": "SOA fields. refresh/retry: seconds between nodes' serial checks; expire: seconds a node may serve the zone without reaching the control plane.",
+        "properties": {
+            "mname": { "type": "string" }, "rname": { "type": "string" },
+            "refresh": { "type": "integer", "minimum": 1 }, "retry": { "type": "integer", "minimum": 1 },
+            "expire": { "type": "integer", "minimum": 1 }, "minimum": { "type": "integer", "minimum": 0 },
+        },
+        "additionalProperties": false,
+    });
+    let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
+    let write = |destructive: bool| json!({ "readOnlyHint": false, "destructiveHint": destructive, "openWorldHint": false });
+    json!([
+        {
+            "name": "list_zones",
+            "title": "List zones",
+            "description": "List every zone with its serial and SOA settings.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": read_only,
+        },
+        {
+            "name": "get_zone",
+            "title": "Get zone",
+            "description": "Get one zone: SOA settings, serial and all records (including LUA scripts).",
+            "inputSchema": { "type": "object", "properties": { "zone": zone }, "required": ["zone"], "additionalProperties": false },
+            "annotations": read_only,
+        },
+        {
+            "name": "create_zone",
+            "title": "Create zone",
+            "description": "Create a zone with its name servers. The SOA is created automatically (mname defaults to the first NS); its serial is managed for you.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": zone,
+                    "ns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Fully qualified name server names, ending in '.'" },
+                    "default_ttl": ttl,
+                    "soa": soa,
+                },
+                "required": ["name", "ns"],
+                "additionalProperties": false,
+            },
+            "annotations": write(false),
+        },
+        {
+            "name": "update_zone",
+            "title": "Update zone settings",
+            "description": "Change a zone's default TTL or SOA fields. Bumps the serial.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "zone": zone, "default_ttl": ttl,
+                    "mname": { "type": "string" }, "rname": { "type": "string" },
+                    "refresh": { "type": "integer", "minimum": 1 }, "retry": { "type": "integer", "minimum": 1 },
+                    "expire": { "type": "integer", "minimum": 1 }, "minimum": { "type": "integer", "minimum": 0 },
+                },
+                "required": ["zone"],
+                "additionalProperties": false,
+            },
+            "annotations": write(false),
+        },
+        {
+            "name": "delete_zone",
+            "title": "Delete zone",
+            "description": "Delete a zone and all its records. DNS nodes stop answering for it within seconds.",
+            "inputSchema": { "type": "object", "properties": { "zone": zone }, "required": ["zone"], "additionalProperties": false },
+            "annotations": write(true),
+        },
+        {
+            "name": "apply_changes",
+            "title": "Apply record changes",
+            "description": format!(
+                "Apply record changes to a zone atomically: all succeed or none do, with every problem reported. \
+                 Names may be \"@\" (apex), relative (\"www\") or absolute (\"www.example.com.\"); names inside record data \
+                 (CNAME/MX/NS targets) must be absolute. Types: A, AAAA, CNAME, MX, TXT, NS, CAA, LUA. A delete without data \
+                 removes the whole RRset. A record added without ttl takes its RRset's TTL, else the zone default. {LUA_HELP}"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "zone": zone,
+                    "changes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": { "type": "string", "enum": ["add", "delete"] },
+                                "name": { "type": "string" },
+                                "type": { "type": "string" },
+                                "ttl": ttl,
+                                "data": { "type": "string", "description": "Record data in zone-file syntax, e.g. \"192.0.2.1\", \"10 mail.example.com.\", \"\\\"some text\\\"\"" },
+                            },
+                            "required": ["action", "name", "type"],
+                            "additionalProperties": false,
+                        },
+                    },
+                },
+                "required": ["zone", "changes"],
+                "additionalProperties": false,
+            },
+            "annotations": write(true),
+        },
+        {
+            "name": "get_changelog",
+            "title": "Read changelog",
+            "description": "Read changelog entries after a sequence number, oldest first. Each entry has the zone, its new serial, and the complete new record set of every name it touched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "after": { "type": "integer", "minimum": 0, "description": "Return entries with seq greater than this (default 0)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Default 100" },
+                },
+                "additionalProperties": false,
+            },
+            "annotations": read_only,
+        },
+    ])
+}
+
+struct Api {
+    base: String,
+    agent: ureq::Agent,
+}
+
+impl Api {
+    fn new(base: &str) -> Self {
+        // 4xx responses carry the API's validation messages; read them instead of failing.
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build();
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            agent: config.into(),
+        }
+    }
+
+    /// One API call. `Err` holds a message for the model: the API's errors, or why the call failed.
+    fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+        let url = format!("{}{path}", self.base);
+        let sent = match (method, body) {
+            ("GET", _) => self.agent.get(&url).call(),
+            ("DELETE", _) => self.agent.delete(&url).call(),
+            ("POST", Some(b)) => self.agent.post(&url).send_json(b),
+            ("PATCH", Some(b)) => self.agent.patch(&url).send_json(b),
+            _ => unreachable!("{method} {path}"),
+        };
+        let mut resp =
+            sent.map_err(|e| format!("Could not reach the control plane at {}: {e}", self.base))?;
+        let status = resp.status();
+        let body: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(body);
+        }
+        let errors: Vec<String> = body["errors"]
+            .as_array()
+            .map(|e| {
+                e.iter()
+                    .filter_map(|m| m.as_str().map(|m| format!("- {m}")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Err(format!(
+            "The control plane rejected this ({status}):\n{}",
+            errors.join("\n")
+        ))
+    }
+}
+
+/// A zone name for a URL path. Zone names never need escaping; anything else is refused.
+fn zone_arg(args: &Value) -> Result<String, String> {
+    let zone = args["zone"]
+        .as_str()
+        .ok_or("missing required argument: zone")?;
+    if zone.is_empty()
+        || !zone
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+    {
+        return Err(format!("invalid zone name {zone:?}"));
+    }
+    Ok(zone.to_string())
+}
+
+/// Runs a tool. `None` = no such tool.
+fn call_tool(api: &Api, name: &str, args: &Value) -> Option<Result<Value, String>> {
+    let with_zone = |f: &dyn Fn(String) -> Result<Value, String>| zone_arg(args).and_then(f);
+    Some(match name {
+        "list_zones" => api.call("GET", "/zones", None),
+        "get_zone" => with_zone(&|z| api.call("GET", &format!("/zones/{z}"), None)),
+        "create_zone" => api.call("POST", "/zones", Some(args)),
+        "update_zone" => with_zone(&|z| {
+            let mut body = args.clone();
+            body.as_object_mut().map(|o| o.remove("zone"));
+            api.call("PATCH", &format!("/zones/{z}"), Some(&body))
+        }),
+        "delete_zone" => with_zone(&|z| api.call("DELETE", &format!("/zones/{z}"), None)),
+        "apply_changes" => with_zone(&|z| {
+            let body = json!({ "changes": args["changes"] });
+            api.call("POST", &format!("/zones/{z}/changes"), Some(&body))
+        }),
+        "get_changelog" => {
+            let after = args["after"].as_u64().unwrap_or(0);
+            let limit = args["limit"].as_u64().unwrap_or(100);
+            api.call(
+                "GET",
+                &format!("/changelog?after={after}&limit={limit}"),
+                None,
+            )
+        }
+        _ => return None,
+    })
+}
+
+fn error(id: &Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// Handles one JSON-RPC message. Returns the response, or None for notifications.
+fn handle(api: &Api, msg: &Value) -> Option<Value> {
+    let id = msg.get("id")?.clone(); // no id: a notification, never answered
+    let params = &msg["params"];
+    let result = match msg["method"].as_str().unwrap_or_default() {
+        "initialize" => {
+            let asked = params["protocolVersion"].as_str().unwrap_or_default();
+            let version = PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == asked)
+                .unwrap_or(&PROTOCOL_VERSIONS[0]);
+            json!({
+                "protocolVersion": version,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "dns-server-db", "title": "DNS control plane", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": "Manages authoritative DNS zones. Changes are validated and applied atomically, then reach every DNS node within seconds. Use get_zone to see current records before changing them.",
+            })
+        }
+        "ping" => json!({}),
+        "tools/list" => json!({ "tools": tools() }),
+        "tools/call" => {
+            let name = params["name"].as_str().unwrap_or_default();
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match call_tool(api, name, &args) {
+                None => return Some(error(&id, -32602, &format!("unknown tool: {name}"))),
+                Some(Ok(v)) => json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap() }],
+                    "isError": false,
+                }),
+                Some(Err(e)) => {
+                    json!({ "content": [{ "type": "text", "text": e }], "isError": true })
+                }
+            }
+        }
+        other => return Some(error(&id, -32601, &format!("method not found: {other}"))),
+    };
+    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn main() {
+    let base =
+        std::env::var("CONTROL_PLANE_URL").unwrap_or_else(|_| "http://127.0.0.1:8053".into());
+    eprintln!("dns-server-db MCP server: control plane {base}");
+    let api = Api::new(&base);
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => handle(&api, &msg),
+            Err(e) => Some(error(&Value::Null, -32700, &format!("parse error: {e}"))),
+        };
+        if let Some(r) = response {
+            let _ = writeln!(out, "{r}");
+            let _ = out.flush();
+        }
+    }
+}

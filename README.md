@@ -6,9 +6,10 @@ See [PLAN.md](PLAN.md) for the full design, decisions, and staged roadmap.
 
 ## Status
 
-**Stage 6 of 7: operations (done).** Prometheus metrics, a health check for anycast, response rate limiting, DNS cookies, and a load test. See [Operations](#operations). Stage 5 (ALIAS) was skipped and can be added later.
+**All planned stages are done (Stage 5, ALIAS, was skipped and can be added later).** The last one, Stage 7, added an MCP server so AI assistants can manage zones through the same validated API. See [MCP server](#mcp-server).
 
 Already in place:
+- **Operations (Stage 6):** Prometheus metrics, a health check for anycast, response rate limiting, DNS cookies, and a load test. See [Operations](#operations).
 - **LuaJIT tailoring (Stage 4):** `LUA` records hold scripts that build answers per query. See [LUA records](#lua-records).
 - **Replication (Stage 3):** DNS nodes follow the control plane's changelog, and a change reaches every node in about a second.
   - A new node replays the whole changelog to catch up.
@@ -26,7 +27,7 @@ Already in place:
 | 4 | LuaJIT tailoring | ✅ Done |
 | 5 | ALIAS (in-zone targets) | Skipped for now |
 | 6 | Ops: metrics, RRL, cookies, anycast health | ✅ Done |
-| 7 | MCP server over the API | Next |
+| 7 | MCP server over the API | ✅ Done |
 
 ## LUA records
 
@@ -81,6 +82,47 @@ Answers that don't come from a script carry ECS scope 0, so resolvers can cache 
 ```bash
 cargo test --release -p dns-server -- --ignored --nocapture script_latency
 ```
+
+## MCP server
+
+`mcp-server` lets MCP clients (Claude Code, Claude Desktop and others) manage zones. It speaks MCP over stdio and calls the control plane's REST API over HTTP. It holds no logic of its own: every change goes through the API's validation and atomic changesets. When the API rejects a change, the tool returns the API's error messages, so the model can correct the request and retry.
+
+| Tool | REST call | Effect |
+|---|---|---|
+| `list_zones` | `GET /zones` | Lists zones with their serial and SOA settings (read-only) |
+| `get_zone` | `GET /zones/{zone}` | Returns a zone's SOA settings and records, including `LUA` scripts (read-only) |
+| `create_zone` | `POST /zones` | Creates a zone with its name servers |
+| `update_zone` | `PATCH /zones/{zone}` | Changes the default TTL or SOA fields |
+| `delete_zone` | `DELETE /zones/{zone}` | Deletes a zone (marked destructive) |
+| `apply_changes` | `POST /zones/{zone}/changes` | Applies an atomic changeset; its description explains `LUA` records (marked destructive) |
+| `get_changelog` | `GET /changelog` | Reads changelog entries (read-only) |
+
+Build it and register it with Claude Code:
+
+```bash
+cargo build --release -p mcp-server
+```
+
+```bash
+claude mcp add dns -e CONTROL_PLANE_URL=http://127.0.0.1:8053 -- "$PWD/target/release/mcp-server"
+```
+
+Or, in a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "dns": {
+      "command": "/absolute/path/to/target/release/mcp-server",
+      "env": { "CONTROL_PLANE_URL": "http://127.0.0.1:8053" }
+    }
+  }
+}
+```
+
+`CONTROL_PLANE_URL` defaults to `http://127.0.0.1:8053`.
+
+There are no permissions yet: anyone who can reach the API, or run this MCP server, can change DNS. Keep the control plane on a trusted network until access control is added.
 
 ## Operations
 
@@ -137,7 +179,7 @@ cargo run --release -p dns-server --example loadgen -- 127.0.0.1:5300 10 4 www.e
 
 ## Layout
 
-A Cargo workspace with two crates:
+A Cargo workspace with three crates:
 
 - `dns-server/`: the authoritative DNS node
   - `src/main.rs`: CLI, UDP/TCP listeners, packet handling (EDNS, truncation)
@@ -155,6 +197,9 @@ A Cargo workspace with two crates:
   - `src/validate.rs`: record parsing, canonical forms, validation rules
   - `migrations/`: the schema, applied automatically at startup
   - `tests/api.rs`: end-to-end test against Postgres
+- `mcp-server/`: MCP server (stdio) over the REST API
+  - `src/main.rs`: JSON-RPC handling, tool definitions, HTTP calls
+  - `tests/mcp.rs`: drives the binary over stdio against a real control plane
 - `scripts/multinode-test.sh`: Docker end-to-end test: propagation, expiry, recovery
 - `Dockerfile`, `docker-compose.yml`: one image with both binaries; the `multinode` compose profile runs the control plane plus two DNS nodes
 

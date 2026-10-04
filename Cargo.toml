@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["dns-server", "control-plane"]
+members = ["dns-server", "control-plane", "mcp-server"]
