@@ -47,6 +47,13 @@ pub fn lookup(store: &Store, qname: &Name, qtype: RecordType) -> Result<Answer> 
             // A CNAME pointing outside our zones: return the chain, the resolver follows it.
             return Ok(ans);
         };
+        if store.zone_expired(&txn, &zone)? {
+            // Stale past SOA EXPIRE: refuse to vouch for anything (RFC 1035 §4.3.5 semantics).
+            ans.rcode = ResponseCode::ServFail;
+            ans.authoritative = false;
+            ans.answers.clear();
+            return Ok(ans);
+        }
         let step = step(store, &txn, &zone, &name, qtype)?;
         // AA describes the original qname (RFC 1034 §6.2.7): only a referral at the first hop clears it.
         if hop == 0 {

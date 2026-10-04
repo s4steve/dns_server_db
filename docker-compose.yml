@@ -1,3 +1,5 @@
+# `docker compose up -d` starts Postgres only (for local development).
+# `docker compose --profile multinode up -d --build` adds the control plane and two DNS nodes.
 services:
   postgres:
     image: postgres:17
@@ -13,6 +15,34 @@ services:
       test: ["CMD", "pg_isready", "-U", "dns"]
       interval: 2s
       retries: 15
+
+  control-plane:
+    profiles: [multinode]
+    build: .
+    command: ["control-plane"]
+    environment:
+      DATABASE_URL: postgres://dns:dns@postgres:5432/dns
+      LISTEN: 0.0.0.0:8053
+    ports:
+      - "127.0.0.1:8054:8053" # 8054 on the host, so it can run beside a local `cargo run` on 8053
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  node1: &node
+    profiles: [multinode]
+    build: .
+    command: ["dns-server", "serve", "/data", "--listen", "0.0.0.0:53", "--follow", "http://control-plane:8053"]
+    ports:
+      - "127.0.0.1:5301:53/udp"
+      - "127.0.0.1:5301:53/tcp"
+    depends_on: [control-plane]
+
+  node2:
+    <<: *node
+    ports:
+      - "127.0.0.1:5302:53/udp"
+      - "127.0.0.1:5302:53/tcp"
 
 volumes:
   pgdata:

@@ -6,23 +6,26 @@ See [PLAN.md](PLAN.md) for the full design, decisions, and staged roadmap.
 
 ## Status
 
-**Stage 2 of 7: control plane (done).** Postgres is the source of truth, and a REST API writes to it. Each write is one transaction that:
+**Stage 3 of 7: replication (done).** DNS nodes follow the control plane's changelog into their local LMDB.
 
-1. validates the result;
-2. bumps the zone's SOA serial;
-3. appends one entry to the changelog.
+- **Propagation:** a change made through the API reaches every node in about a second. Nodes poll every second, and each page of entries is applied in one LMDB transaction together with the node's position in the changelog, so a crash never leaves a node half-updated.
+- **New nodes** start from changelog position 0 and replay everything. Each entry carries the complete record set of every name it touches, so the replay ends at the current state.
+- **Expiry:** a node that can't reach the control plane keeps serving until a zone's SOA EXPIRE passes since its last successful sync. After that it returns SERVFAIL for the zone. When the control plane comes back, the node catches up and serves again.
+- **Bad data:** an entry the node can't parse stops it from advancing; it never skips the entry. Its zones then expire safely rather than serve data it doesn't understand.
 
-Invalid changesets are rejected whole, with every problem listed. The DNS nodes don't follow the changelog yet; that's Stage 3.
+Differences from the plan:
+- SOA REFRESH and RETRY aren't used. Continuous one-second polling replaces REFRESH. After a failure, the node retries with exponential backoff, capped at 10 seconds.
+- There's no snapshot endpoint yet: a new node replays the full changelog. A snapshot only becomes necessary once old changelog entries get pruned.
 
-Already in place from Stage 1: the LMDB-backed DNS server, with RFC-correct answers (NODATA/NXDOMAIN, wildcards, CNAME chains, referrals with glue), EDNS0, and truncation with TCP retry. See the [Stage 1 commit](https://github.com/s4steve/dns_server_db/commit/72c90b0) for details.
+Earlier stages: the [control plane](https://github.com/s4steve/dns_server_db/commit/507e82a) (Postgres, validated atomic changesets, REST API) and the [DNS answer engine](https://github.com/s4steve/dns_server_db/commit/72c90b0) (RFC-correct lookups, EDNS0, truncation).
 
 | Stage | Scope | Status |
 |---|---|---|
 | 0 | Skeleton UDP/TCP server | ✅ Done |
 | 1 | LMDB data model + RFC-correct lookup engine | ✅ Done |
 | 2 | Control plane: Postgres, validation, REST API, changelog | ✅ Done |
-| 3 | Replication to nodes, SOA-driven expiry | Next |
-| 4 | LuaJIT tailoring | |
+| 3 | Replication to nodes, SOA-driven expiry | ✅ Done |
+| 4 | LuaJIT tailoring | Next |
 | 5 | ALIAS (in-zone targets) | |
 | 6 | Ops: metrics, RRL, cookies, anycast health | |
 | 7 | MCP server over the API | |
@@ -35,12 +38,15 @@ A Cargo workspace with two crates:
   - `src/main.rs`: CLI, UDP/TCP listeners, packet handling (EDNS, truncation)
   - `src/store.rs`: LMDB store: key layout, zone loading, lookups
   - `src/lookup.rs`: authoritative answer logic
+  - `src/follow.rs`: changelog follower (polling, atomic apply, sync state)
   - `testdata/`: test zones and `cases.txt`, the golden answer file (a query followed by its expected response, checked by `cargo test`)
 - `control-plane/`: the REST API over Postgres
   - `src/api.rs`: routes, transactions, serial bumps, changelog
   - `src/validate.rs`: record parsing, canonical forms, validation rules
   - `migrations/`: the schema, applied automatically at startup
   - `tests/api.rs`: end-to-end test against Postgres
+- `scripts/multinode-test.sh`: Docker end-to-end test: propagation, expiry, recovery
+- `Dockerfile`, `docker-compose.yml`: one image with both binaries; the `multinode` compose profile runs the control plane plus two DNS nodes
 
 ## Running
 
@@ -104,20 +110,30 @@ Each changelog entry carries the complete new record set of every name it touche
 
 ### DNS server
 
-Load a zone file (repeat to replace it, even while the server is running):
+Follow a control plane (the normal mode):
+
+```bash
+cargo run -p dns-server -- serve ./db --follow http://127.0.0.1:8053
+```
+
+Flags: `--listen ADDR` (default `127.0.0.1:5300`; port 53 needs root) and `--poll-ms N` (default 1000).
+
+```bash
+dig @127.0.0.1 -p 5300 www.example.com A
+```
+
+Without `--follow`, the server serves whatever is in `./db` and never expires it. That's useful with zone files:
 
 ```bash
 cargo run -p dns-server -- load ./db dns-server/testdata/example.com.zone
 ```
 
-Serve (listens on `127.0.0.1:5300` by default; port 53 needs root):
+### Multi-node test
+
+Builds the image, starts Postgres, the control plane (on host port 8054) and two DNS nodes (on host ports 5301 and 5302), then checks propagation, expiry and recovery:
 
 ```bash
-cargo run -p dns-server -- serve ./db
-```
-
-```bash
-dig @127.0.0.1 -p 5300 www.example.com A
+./scripts/multinode-test.sh
 ```
 
 ## License
