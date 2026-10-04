@@ -13,8 +13,9 @@ See [PLAN.md](PLAN.md) for the full design, decisions, and staged roadmap.
 - **Expiry:** a node that can't reach the control plane keeps serving until a zone's SOA EXPIRE passes since its last successful sync. After that it returns SERVFAIL for the zone. When the control plane comes back, the node catches up and serves again.
 - **Bad data:** an entry the node can't parse stops it from advancing; it never skips the entry. Its zones then expire safely rather than serve data it doesn't understand.
 
+- **SOA REFRESH and RETRY:** every REFRESH seconds, a node compares each zone's serial with the control plane's. If they differ, it re-fetches the zone; a failed check is retried after RETRY seconds. This repairs drift the changelog can't see, like a local edit. It also makes the node an exact mirror: zones the control plane doesn't have are removed. The check only runs when the node is caught up with the changelog, so a change still on its way isn't mistaken for drift.
+
 Differences from the plan:
-- SOA REFRESH and RETRY aren't used. Continuous one-second polling replaces REFRESH. After a failure, the node retries with exponential backoff, capped at 10 seconds.
 - There's no snapshot endpoint yet: a new node replays the full changelog. A snapshot only becomes necessary once old changelog entries get pruned.
 
 Earlier stages: the [control plane](https://github.com/s4steve/dns_server_db/commit/507e82a) (Postgres, validated atomic changesets, REST API) and the [DNS answer engine](https://github.com/s4steve/dns_server_db/commit/72c90b0) (RFC-correct lookups, EDNS0, truncation).
@@ -24,7 +25,7 @@ Earlier stages: the [control plane](https://github.com/s4steve/dns_server_db/com
 | 0 | Skeleton UDP/TCP server | ✅ Done |
 | 1 | LMDB data model + RFC-correct lookup engine | ✅ Done |
 | 2 | Control plane: Postgres, validation, REST API, changelog | ✅ Done |
-| 3 | Replication to nodes, SOA-driven expiry | ✅ Done |
+| 3 | Replication to nodes, SOA REFRESH/RETRY/EXPIRE | ✅ Done |
 | 4 | LuaJIT tailoring | Next |
 | 5 | ALIAS (in-zone targets) | |
 | 6 | Ops: metrics, RRL, cookies, anycast health | |
@@ -38,7 +39,7 @@ A Cargo workspace with two crates:
   - `src/main.rs`: CLI, UDP/TCP listeners, packet handling (EDNS, truncation)
   - `src/store.rs`: LMDB store: key layout, zone loading, lookups
   - `src/lookup.rs`: authoritative answer logic
-  - `src/follow.rs`: changelog follower (polling, atomic apply, sync state)
+  - `src/follow.rs`: changelog follower (polling, atomic apply, sync state) and SOA REFRESH/RETRY checks
   - `testdata/`: test zones and `cases.txt`, the golden answer file (a query followed by its expected response, checked by `cargo test`)
 - `control-plane/`: the REST API over Postgres
   - `src/api.rs`: routes, transactions, serial bumps, changelog
@@ -86,7 +87,7 @@ curl -X POST localhost:8053/zones/example.com/changes -H 'content-type: applicat
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/zones` | List zones |
+| `GET` | `/zones` | List zones, plus `seq` (the changelog head in the same snapshot; nodes use it for REFRESH checks) |
 | `POST` | `/zones` | Create: `name`, `ns[]`, optional `default_ttl`, `soa{mname,rname,refresh,retry,expire,minimum}` |
 | `GET` | `/zones/{zone}` | Zone, SOA and all records |
 | `PATCH` | `/zones/{zone}` | Change `default_ttl` or SOA fields |
@@ -130,7 +131,7 @@ cargo run -p dns-server -- load ./db dns-server/testdata/example.com.zone
 
 ### Multi-node test
 
-Builds the image, starts Postgres, the control plane (on host port 8054) and two DNS nodes (on host ports 5301 and 5302), then checks propagation, expiry and recovery:
+Builds the image, starts Postgres, the control plane (on host port 8054) and two DNS nodes (on host ports 5301 and 5302), then checks propagation, REFRESH repair, expiry and recovery:
 
 ```bash
 ./scripts/multinode-test.sh

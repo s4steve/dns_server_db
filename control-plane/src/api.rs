@@ -194,34 +194,51 @@ async fn append_changelog(
 
 // ---------- zones ----------
 
+/// All zones, plus `seq`: the changelog head in the same snapshot. A node whose applied seq
+/// equals `seq` can compare serials without a change in flight causing a false mismatch.
 async fn list_zones(State(pool): State<PgPool>) -> ApiResult<Json<Value>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
     let zones: Vec<ZoneRow> = sqlx::query_as(
         "SELECT id, name, default_ttl, mname, rname, serial, refresh, retry, expire, minimum
          FROM zones ORDER BY name",
     )
-    .fetch_all(&pool)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(Json(
-        json!({ "zones": zones.iter().map(ZoneRow::json).collect::<Vec<_>>() }),
-    ))
+    let seq: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM changelog")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({
+        "seq": seq,
+        "zones": zones.iter().map(ZoneRow::json).collect::<Vec<_>>(),
+    })))
 }
 
 async fn get_zone(State(pool): State<PgPool>, Path(zone): Path<String>) -> ApiResult<Json<Value>> {
     let zone = validate::parse_zone(&zone).map_err(bad)?;
+    // One snapshot, so the serial always matches the records (nodes re-fetch from here).
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
     let row: ZoneRow = sqlx::query_as(
         "SELECT id, name, default_ttl, mname, rname, serial, refresh, retry, expire, minimum
          FROM zones WHERE name = $1",
     )
     .bind(zone.to_string())
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("zone {zone} not found")))?;
     let records: Vec<RecordRow> = sqlx::query_as(
         "SELECT name, type, ttl, data FROM records WHERE zone_id = $1 ORDER BY name, type, data",
     )
     .bind(row.id)
-    .fetch_all(&pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let mut body = row.json();
     body["records"] = records
         .iter()

@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithTls};
+use hickory_proto::rr::rdata::SOA;
 use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 
@@ -43,20 +44,33 @@ pub struct Store {
 }
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         // SAFETY: the env is opened once per process and the files are only touched through LMDB.
-        let env = unsafe { EnvOpenOptions::new().map_size(MAP_SIZE).max_dbs(3).open(path)? };
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(MAP_SIZE)
+                .max_dbs(3)
+                .open(path)?
+        };
         let mut w = env.write_txn()?;
         let zones = env.create_database(&mut w, Some("zones"))?;
         let names = env.create_database(&mut w, Some("names"))?;
         let meta = env.create_database(&mut w, Some("meta"))?;
         w.commit()?;
-        Ok(Self { env, zones, names, meta, enforce_expiry: false })
+        Ok(Self {
+            env,
+            zones,
+            names,
+            meta,
+            enforce_expiry: false,
+        })
     }
 
     pub fn read_txn(&self) -> Result<RoTxn<'_, WithTls>> {
@@ -86,12 +100,32 @@ impl Store {
         if !self.enforce_expiry {
             return Ok(false);
         }
-        let Some(expire) = self.zones.get(txn, &name_key(zone))? else { return Ok(true) };
+        let Some(expire) = self.zones.get(txn, &name_key(zone))? else {
+            return Ok(true);
+        };
         let expire = u32::from_be_bytes(expire.try_into()?);
         Ok(match self.get_meta(txn, LAST_SYNC)? {
             Some(last) => now() > last + u64::from(expire),
             None => true,
         })
+    }
+
+    /// Every zone with its SOA.
+    pub fn zones(&self, txn: &RoTxn) -> Result<Vec<(Name, SOA)>> {
+        let mut out = vec![];
+        for entry in self.zones.iter(txn)? {
+            let zone = key_to_name(entry?.0)?;
+            let apex = self.records(txn, &zone, &zone)?.unwrap_or_default();
+            let soa = apex.into_iter().find_map(|r| match r.data {
+                RData::SOA(soa) => Some(soa),
+                _ => None,
+            });
+            out.push((
+                zone.clone(),
+                soa.ok_or_else(|| format!("zone {zone} has no SOA"))?,
+            ));
+        }
+        Ok(out)
     }
 
     pub fn has_zone(&self, txn: &RoTxn, zone: &Name) -> Result<bool> {
@@ -109,7 +143,11 @@ impl Store {
     /// Whether `name` exists in the RFC 4592 sense: it has records or any descendant does,
     /// so empty non-terminals count.
     pub fn exists(&self, txn: &RoTxn, zone: &Name, name: &Name) -> Result<bool> {
-        Ok(self.names.prefix_iter(txn, &record_key(zone, name))?.next().is_some())
+        Ok(self
+            .names
+            .prefix_iter(txn, &record_key(zone, name))?
+            .next()
+            .is_some())
     }
 
     /// Atomically replaces everything in `origin` with `records`.
@@ -122,7 +160,9 @@ impl Store {
             let entry = by_name.entry(record_key(origin, &r.name));
             entry.or_insert_with(|| (r.name.clone(), vec![])).1.push(r);
         }
-        let apex = by_name.get(&record_key(origin, origin)).map(|(_, recs)| recs.as_slice());
+        let apex = by_name
+            .get(&record_key(origin, origin))
+            .map(|(_, recs)| recs.as_slice());
         let expire = soa_expire(apex.unwrap_or_default())
             .ok_or_else(|| format!("zone {origin} has no SOA at its apex"))?;
 
@@ -154,7 +194,13 @@ impl Store {
     }
 
     /// Replaces every record at `name`; an empty slice removes the name.
-    pub fn put_name(&self, w: &mut RwTxn, zone: &Name, name: &Name, records: &[Record]) -> Result<()> {
+    pub fn put_name(
+        &self,
+        w: &mut RwTxn,
+        zone: &Name,
+        name: &Name,
+        records: &[Record],
+    ) -> Result<()> {
         let key = record_key(zone, name);
         if records.is_empty() {
             self.names.delete(w, &key)?;
@@ -192,6 +238,20 @@ fn name_key(name: &Name) -> Vec<u8> {
         key.extend(label.iter().map(u8::to_ascii_lowercase));
     }
     key
+}
+
+fn key_to_name(key: &[u8]) -> Result<Name> {
+    let mut labels = vec![];
+    let mut rest = key;
+    while let Some((&len, tail)) = rest.split_first() {
+        let (label, tail) = tail
+            .split_at_checked(len as usize)
+            .ok_or("corrupt name key")?;
+        labels.push(label);
+        rest = tail;
+    }
+    labels.reverse();
+    Ok(Name::from_labels(labels)?)
 }
 
 fn record_key(zone: &Name, name: &Name) -> Vec<u8> {
