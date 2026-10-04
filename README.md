@@ -34,7 +34,7 @@ Already in place:
 A `LUA` record's data is `<TYPE> <script>`. The script answers queries of that type at that name, and it overrides any static records of the same type there:
 
 ```bash
-curl -X POST localhost:8053/zones/example.com/changes -H 'content-type: application/json' -d @- <<'EOF'
+curl -X POST localhost:8053/zones/example.com/changes -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d @- <<'EOF'
 {"changes":[{"action":"add","name":"www","type":"LUA","ttl":60,
   "data":"A if in_cidr(q.client, '10.0.0.0/8') then return '192.0.2.10' end return {'192.0.2.20', '192.0.2.21'}"}]}
 EOF
@@ -95,7 +95,8 @@ cargo test --release -p dns-server -- --ignored --nocapture script_latency
 | `update_zone` | `PATCH /zones/{zone}` | Changes the default TTL or SOA fields |
 | `delete_zone` | `DELETE /zones/{zone}` | Deletes a zone (marked destructive) |
 | `apply_changes` | `POST /zones/{zone}/changes` | Applies an atomic changeset; its description explains `LUA` records (marked destructive) |
-| `get_changelog` | `GET /changelog` | Reads changelog entries (read-only) |
+| `get_changelog` | `GET /changelog` | Reads changelog entries for zones the token can see, including who made each change (read-only) |
+| `whoami` | `GET /whoami` | Shows the token's name and grants (read-only) |
 
 Build it and register it with Claude Code:
 
@@ -104,7 +105,7 @@ cargo build --release -p mcp-server
 ```
 
 ```bash
-claude mcp add dns -e CONTROL_PLANE_URL=http://127.0.0.1:8053 -- "$PWD/target/release/mcp-server"
+claude mcp add dns -e CONTROL_PLANE_URL=http://127.0.0.1:8053 -e CONTROL_PLANE_TOKEN=dnsdb_... -- "$PWD/target/release/mcp-server"
 ```
 
 Or, in a project's `.mcp.json`:
@@ -114,7 +115,7 @@ Or, in a project's `.mcp.json`:
   "mcpServers": {
     "dns": {
       "command": "/absolute/path/to/target/release/mcp-server",
-      "env": { "CONTROL_PLANE_URL": "http://127.0.0.1:8053" }
+      "env": { "CONTROL_PLANE_URL": "http://127.0.0.1:8053", "CONTROL_PLANE_TOKEN": "dnsdb_..." }
     }
   }
 }
@@ -122,7 +123,64 @@ Or, in a project's `.mcp.json`:
 
 `CONTROL_PLANE_URL` defaults to `http://127.0.0.1:8053`.
 
-There are no permissions yet: anyone who can reach the API, or run this MCP server, can change DNS. Keep the control plane on a trusted network until access control is added.
+The MCP server can do exactly what its token allows (see [Access control](#access-control)), and the `whoami` tool shows the model what that is. Give it a token scoped to the zones it should manage, and leave out `scripts` unless it should write `LUA` records.
+
+## Access control
+
+Every API call needs a bearer token: `Authorization: Bearer dnsdb_...`. Missing, invalid, expired or revoked tokens get 401.
+
+A token has a **name**, which is recorded as the `actor` on every change it makes, plus **grants** (zone pattern, role, scripts) and an optional **admin** flag.
+
+| Pattern | Matches |
+|---|---|
+| `example.com` | That zone |
+| `*.example.com` | Zones below it, not `example.com` itself |
+| `*` | Every zone |
+
+| Role | Can |
+|---|---|
+| `viewer` | Read the zone, and see it in `/zones` and `/changelog` |
+| `editor` | Everything a viewer can, plus apply record changes |
+| `owner` | Everything an editor can, plus change zone settings and delete the zone. Can also create zones matching the pattern (so `*.team.example.com` lets a team create its own zones). |
+| `scripts` (flag) | Add or delete `LUA` records, which run code on every DNS node. Needs editor or owner. |
+| `admin` (token flag) | Owner with scripts on every zone, plus token management |
+
+A token's role on a zone is the highest role among its matching grants:
+- A zone the token can't see returns 404, so its existence doesn't leak.
+- A zone it can see, but lacks the role for, returns 403.
+
+**Minting the first admin token:** run the `create-token` subcommand against the database. It prints the secret, which is shown only once:
+
+```bash
+TOKEN=$(cargo run -q -p control-plane -- create-token --name ops-admin --admin)
+```
+
+The same command creates scoped tokens, such as one for DNS nodes (read-only, every zone):
+
+```bash
+cargo run -q -p control-plane -- create-token --name dns-nodes --grant '*:viewer'
+```
+
+Add `--secret VALUE` to register a value you already have, which suits configuration management, and `--if-missing` to make the command safe to re-run.
+
+**Managing tokens over the API** (admin only):
+- `POST /tokens` with `{"name", "admin", "grants": [{"pattern", "role", "scripts"}], "expires_in_days"}` returns the secret once.
+- `GET /tokens` lists every token, without secrets.
+- `DELETE /tokens/{name}` revokes a token. The row is kept, so its name stays reserved and changelog actors still make sense.
+- `GET /whoami` shows any token its own grants.
+
+**Clients** read their token from `CONTROL_PLANE_TOKEN`, an environment variable, so it never appears in a process list:
+- DNS nodes need a `*:viewer` token.
+- The MCP server needs whatever its users should be allowed to do.
+
+The multi-node compose setup mints fixed dev tokens, which are public and dev-only.
+
+**Upgrading from a version without access control:**
+1. Start the new control plane; it adds the auth tables automatically.
+2. Mint tokens.
+3. Give nodes and the MCP server their tokens.
+
+Until step 3, nodes log "rejected the token (401)" but keep serving their zones until EXPIRE (7 days by default).
 
 ## Operations
 
@@ -193,7 +251,8 @@ A Cargo workspace with three crates:
   - `examples/loadgen.rs`: UDP load generator
   - `testdata/`: test zones and `cases.txt`, the golden answer file (a query followed by its expected response, checked by `cargo test`)
 - `control-plane/`: the REST API over Postgres
-  - `src/api.rs`: routes, transactions, serial bumps, changelog
+  - `src/api.rs`: routes, transactions, serial bumps, changelog, token endpoints
+  - `src/auth.rs`: tokens, grants, roles, request authentication
   - `src/validate.rs`: record parsing, canonical forms, validation rules
   - `migrations/`: the schema, applied automatically at startup
   - `tests/api.rs`: end-to-end test against Postgres
@@ -221,7 +280,7 @@ cargo test
 
 ### Control plane
 
-Listens on `127.0.0.1:8053`. Override with the `LISTEN` and `DATABASE_URL` environment variables.
+Listens on `127.0.0.1:8053`. Override with the `LISTEN` and `DATABASE_URL` environment variables. Every request needs a token; mint the first one with `create-token` (see [Access control](#access-control)).
 
 ```bash
 cargo run -p control-plane
@@ -230,13 +289,13 @@ cargo run -p control-plane
 Create a zone (SOA fields are optional; mname defaults to the first NS):
 
 ```bash
-curl -X POST localhost:8053/zones -H 'content-type: application/json' -d '{"name":"example.com","ns":["ns1.example.com."]}'
+curl -X POST localhost:8053/zones -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"name":"example.com","ns":["ns1.example.com."]}'
 ```
 
 Apply a changeset (all-or-nothing):
 
 ```bash
-curl -X POST localhost:8053/zones/example.com/changes -H 'content-type: application/json' -d '{"changes":[{"action":"add","name":"www","type":"A","data":"192.0.2.10"}]}'
+curl -X POST localhost:8053/zones/example.com/changes -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"changes":[{"action":"add","name":"www","type":"A","data":"192.0.2.10"}]}'
 ```
 
 | Method | Path | Purpose |
@@ -247,7 +306,9 @@ curl -X POST localhost:8053/zones/example.com/changes -H 'content-type: applicat
 | `PATCH` | `/zones/{zone}` | Change `default_ttl` or SOA fields |
 | `DELETE` | `/zones/{zone}` | Delete the zone |
 | `POST` | `/zones/{zone}/changes` | `{"changes":[...]}`, each `add` (name, type, data, optional ttl) or `delete` (name, type, optional data; without data, deletes the whole RRset) |
-| `GET` | `/changelog?after=SEQ&limit=N` | Changelog entries after `SEQ`, oldest first |
+| `GET` | `/changelog?after=SEQ&limit=N` | Changelog entries after `SEQ`, oldest first, for zones the token can see. Each has an `actor`; continue from `next_after`. |
+| `GET` | `/whoami` | The calling token's name and grants |
+| `POST`, `GET`, `DELETE` | `/tokens`, `/tokens/{name}` | Token management (admin) |
 
 Names may be `@` (the zone apex), relative (`www`), or absolute (`www.example.com.`). Names inside record data (CNAME, MX and NS targets) must be absolute.
 
@@ -269,7 +330,7 @@ Each changelog entry carries the complete new record set of every name it touche
 Follow a control plane (the normal mode):
 
 ```bash
-cargo run -p dns-server -- serve ./db --follow http://127.0.0.1:8053
+CONTROL_PLANE_TOKEN=dnsdb_... cargo run -p dns-server -- serve ./db --follow http://127.0.0.1:8053
 ```
 
 Flags:

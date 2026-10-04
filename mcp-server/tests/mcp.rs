@@ -6,8 +6,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
-/// Starts the control plane on a free port in a background runtime; returns its URL.
-fn control_plane() -> String {
+/// Starts the control plane on a free port in a background runtime. Returns its URL and a
+/// function that mints tokens: (name prefix, admin, grants as "PATTERN:ROLE[:scripts]").
+fn control_plane() -> (String, impl Fn(&str, bool, &[&str]) -> String) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -18,14 +19,44 @@ fn control_plane() -> String {
                 panic!("can't reach Postgres at {url} (run `docker compose up -d`): {e}")
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            tx.send(format!("http://{}", listener.local_addr().unwrap()))
-                .unwrap();
+            tx.send((
+                format!("http://{}", listener.local_addr().unwrap()),
+                pool.clone(),
+            ))
+            .unwrap();
             axum::serve(listener, control_plane::api::router(pool))
                 .await
                 .unwrap();
         });
     });
-    rx.recv().unwrap()
+    let (url, pool) = rx.recv().unwrap();
+    let mint = move |name: &str, admin: bool, grants: &[&str]| {
+        let grants: Vec<_> = grants
+            .iter()
+            .map(|g| control_plane::auth::Grant::parse_cli(g).unwrap())
+            .collect();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (pool, name) = (pool.clone(), format!("{name}{nanos}"));
+        // On its own thread: the pool belongs to the server's runtime, not this one.
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    control_plane::auth::create_token(
+                        &pool, &name, admin, &grants, None, None, false,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                })
+        })
+        .join()
+        .unwrap()
+    };
+    (url, mint)
 }
 
 struct Client {
@@ -36,8 +67,9 @@ struct Client {
 }
 
 impl Client {
-    fn start(control_plane: &str) -> Self {
+    fn start(control_plane: &str, token: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-server"))
+            .env("CONTROL_PLANE_TOKEN", token)
             .env("CONTROL_PLANE_URL", control_plane)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -87,7 +119,8 @@ impl Client {
 
 #[test]
 fn mcp_round_trip() {
-    let mut c = Client::start(&control_plane());
+    let (url, mint) = control_plane();
+    let mut c = Client::start(&url, &mint("mcp-admin-", true, &[]));
 
     // Handshake: our version echoed back; tools capability; then the initialized notification
     // must produce no response (the next line read belongs to the next request).
@@ -117,7 +150,8 @@ fn mcp_round_trip() {
             "update_zone",
             "delete_zone",
             "apply_changes",
-            "get_changelog"
+            "get_changelog",
+            "whoami"
         ]
     );
     for t in tools["result"]["tools"].as_array().unwrap() {
@@ -223,6 +257,26 @@ fn mcp_round_trip() {
         -32601
     );
 
+    // whoami reports the token; a viewer token's changes come back as a 403 tool error, and
+    // no token at all as a 401.
+    let (err, text) = c.tool("whoami", json!({}));
+    assert!(!err && text.contains("\"admin\": true"), "{text}");
+    let mut viewer = Client::start(
+        &url,
+        &mint("mcp-viewer-", false, &[&format!("{zone}:viewer")]),
+    );
+    assert!(!viewer.tool("get_zone", json!({ "zone": zone })).0);
+    let (err, text) = viewer.tool(
+        "apply_changes",
+        json!({ "zone": zone, "changes": [
+            { "action": "add", "name": "x", "type": "A", "data": "192.0.2.1" },
+        ]}),
+    );
+    assert!(err && text.contains("403"), "{text}");
+    let mut anonymous = Client::start(&url, "");
+    let (err, text) = anonymous.tool("list_zones", json!({}));
+    assert!(err && text.contains("401"), "{text}");
+
     let (err, text) = c.tool("delete_zone", json!({ "zone": zone }));
     assert!(!err, "{text}");
     assert!(c.tool("get_zone", json!({ "zone": zone })).0);
@@ -230,7 +284,7 @@ fn mcp_round_trip() {
 
 #[test]
 fn reports_unreachable_control_plane() {
-    let mut c = Client::start("http://127.0.0.1:9"); // discard port: nothing listens
+    let mut c = Client::start("http://127.0.0.1:9", "unused"); // discard port: nothing listens
     let (err, text) = c.tool("list_zones", json!({}));
     assert!(err);
     assert!(text.contains("Could not reach the control plane"), "{text}");
