@@ -245,13 +245,21 @@ fn tailor(
         node: client.node,
         statics: statics.iter().map(|r| r.data.to_string()).collect(),
     };
-    match script::run(source, &input) {
+    crate::metrics::inc(&crate::metrics::LUA_RUNS);
+    let outcome = script::run(source, &input);
+    if matches!(outcome, Outcome::Error(_)) {
+        crate::metrics::inc(&crate::metrics::LUA_ERRORS);
+    }
+    match outcome {
         Outcome::Answer(items) => items
             .iter()
             .map(|text| {
                 RData::try_from_str(qtype, text)
                     .map(|data| Some(Record::from_rdata(qname.clone(), ttl, data)))
-                    .map_err(|e| format!("returned {text:?}, not valid {qtype} data: {e}"))
+                    .map_err(|e| {
+                        crate::metrics::inc(&crate::metrics::LUA_ERRORS);
+                        format!("returned {text:?}, not valid {qtype} data: {e}")
+                    })
             })
             .collect::<std::result::Result<Option<Vec<_>>, _>>(),
         Outcome::Empty => Ok(None),

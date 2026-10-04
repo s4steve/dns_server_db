@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+axum = "0.8.9"
 heed = "0.22.1"
 hickory-proto = "0.26"
 mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+siphasher = "1.0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 ureq = { version = "3.4.2", features = ["json"] }
 
 [dev-dependencies]
-serde_json = "1.0.151"

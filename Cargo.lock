@@ -383,11 +383,13 @@ dependencies = [
 name = "dns-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "heed",
  "hickory-proto",
  "mlua",
  "serde",
  "serde_json",
+ "siphasher",
  "tokio",
  "ureq",
 ]

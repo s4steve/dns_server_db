@@ -68,6 +68,7 @@ pub fn run(store: Arc<Store>, control_plane: String, poll: Duration) {
             }
             Err(e) => {
                 eprintln!("follow {control_plane}: {e}");
+                crate::metrics::inc(&crate::metrics::FOLLOW_ERRORS);
                 wait = (wait * 2).min(MAX_BACKOFF);
             }
         }
@@ -261,10 +262,12 @@ impl Checks {
                         "refresh: {zone} serial {} here, {serial} upstream; re-fetching",
                         soa.serial
                     );
+                    crate::metrics::inc(&crate::metrics::REFRESH_REPAIRS);
                     refetch(store, control_plane, zone)
                 }
                 None => {
                     eprintln!("refresh: {zone} is not on the control plane; removing it");
+                    crate::metrics::inc(&crate::metrics::REFRESH_REPAIRS);
                     remove(store, zone)
                 }
             };

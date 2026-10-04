@@ -188,7 +188,7 @@ pub fn check_name(zone: &Name, name: &Name, records: &[(RecordType, u32, &str)])
     }
     if cnames > 0 && name == zone {
         errors.push(format!(
-            "{name}: CNAME is not allowed at the zone apex (use ALIAS)"
+            "{name}: CNAME is not allowed at the zone apex (RFC 1912 §2.4)"
         ));
     }
     if name == zone && of_type(RecordType::NS).count() == 0 {

@@ -4,8 +4,10 @@
 #   2. SOA REFRESH: a node whose copy of a zone drifts (here: edited behind its back) is
 #      repaired within REFRESH, and a zone the control plane doesn't have is removed.
 #   3. LUA scripts run on every node: per-node answers (q.node) and per-subnet answers (ECS).
-#   4. With the control plane gone, nodes keep serving until the zone's SOA EXPIRE passes,
-#      then SERVFAIL. When it comes back, they catch up and serve again.
+#   4. Ops: /health and /metrics on each node; a DNS cookie from one node validates on the
+#      other (shared --cookie-secret, as behind anycast).
+#   5. With the control plane gone, nodes keep serving until the zone's SOA EXPIRE passes,
+#      then SERVFAIL (and count the zone as expired). When it comes back, they catch up.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -104,6 +106,37 @@ scope=$(dig @127.0.0.1 -p 5301 +subnet=10.1.2.0/24 "geo.$ZONE" A | grep -o 'CLIE
 [[ "$inside" == 192.0.2.10 && "$outside" == 192.0.2.20 ]] || fail "geo: got $inside / $outside"
 echo "   geo: 10.1.2.0/24 gets $inside, 203.0.113.0/24 gets $outside ($scope)"
 
+echo "== ops: health, metrics, cookies across nodes"
+for port in 9301 9302; do
+  curl -sf "127.0.0.1:$port/health" | grep -q '"healthy":true' || fail "node on $port not healthy"
+done
+curl -sf 127.0.0.1:9301/metrics | grep -q '^dns_queries_total{transport="udp",rcode="NOERROR"} [1-9]' || fail "no query metrics"
+echo "   both nodes healthy; metrics exported"
+# macOS's dig predates +cookie, so speak COOKIE (EDNS option 10) from Python: get a server
+# cookie from node1, present it to node2, and watch node2 count it as valid.
+cookie_query() { python3 - "$@" <<'PYEOF'
+import socket, struct, sys
+port, name, cookie = int(sys.argv[1]), sys.argv[2], bytes.fromhex(sys.argv[3])
+qname = b"".join(bytes([len(l)]) + l.encode() for l in name.rstrip(".").split(".")) + b"\0"
+opt = b"\0" + struct.pack(">HHIH", 41, 1232, 0, 4 + len(cookie)) + struct.pack(">HH", 10, len(cookie)) + cookie
+msg = struct.pack(">HHHHHH", 0x1234, 0, 1, 0, 0, 1) + qname + struct.pack(">HH", 1, 1) + opt
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+s.sendto(msg, ("127.0.0.1", port))
+resp = s.recv(4096)
+i = resp.find(b"\x00\x0a\x00\x18" + cookie[:8])
+print(resp[i + 4:i + 28].hex() if i >= 0 else "")
+PYEOF
+}
+valid_cookies() { curl -sf "127.0.0.1:$1/metrics" | sed -n 's/^dns_cookies_valid_total //p'; }
+cookie=$(cookie_query 5301 "www.$ZONE" 0102030405060708)
+[[ ${#cookie} == 48 ]] || fail "no server cookie from node1 (got '$cookie')"
+before=$(valid_cookies 9302)
+cookie_query 5302 "www.$ZONE" "$cookie" >/dev/null
+after=$(valid_cookies 9302)
+(( after == before + 1 )) || fail "node2 didn't accept node1's cookie ($before -> $after)"
+echo "   node1's server cookie is accepted by node2"
+expired_before=$(curl -sf 127.0.0.1:9301/metrics | sed -n 's/^dns_zones_expired //p')
+
 echo "== cut off: stop the control plane"
 docker compose stop control-plane >/dev/null
 stopped=$SECONDS
@@ -112,6 +145,9 @@ all_answer "www.$ZONE" 198.51.100.7 || fail "nodes stopped serving before EXPIRE
 echo "   still serving 2s later (within EXPIRE)"
 wait_for $(( EXPIRE + 5 )) all_status "www.$ZONE" SERVFAIL >/dev/null || fail "nodes still serving past EXPIRE"
 echo "   both nodes SERVFAIL $(( SECONDS - stopped ))s after the control plane stopped (EXPIRE ${EXPIRE}s)"
+expired_now=$(curl -sf 127.0.0.1:9301/metrics | sed -n 's/^dns_zones_expired //p')
+(( expired_now > expired_before )) || fail "dns_zones_expired didn't rise ($expired_before -> $expired_now)"
+echo "   dns_zones_expired: $expired_before -> $expired_now"
 
 echo "== reconnect: start the control plane"
 docker compose start control-plane >/dev/null

@@ -6,9 +6,10 @@ See [PLAN.md](PLAN.md) for the full design, decisions, and staged roadmap.
 
 ## Status
 
-**Stage 4 of 7: LuaJIT tailoring (done).** `LUA` records hold scripts that build answers per query: by client subnet, by query name, or by any other logic. See [LUA records](#lua-records).
+**Stage 6 of 7: operations (done).** Prometheus metrics, a health check for anycast, response rate limiting, DNS cookies, and a load test. See [Operations](#operations). Stage 5 (ALIAS) was skipped and can be added later.
 
 Already in place:
+- **LuaJIT tailoring (Stage 4):** `LUA` records hold scripts that build answers per query. See [LUA records](#lua-records).
 - **Replication (Stage 3):** DNS nodes follow the control plane's changelog, and a change reaches every node in about a second.
   - A new node replays the whole changelog to catch up.
   - Every SOA REFRESH seconds, a node compares each zone's serial with the control plane's. If they differ, it re-fetches the zone; a failed check is retried after RETRY seconds. This repairs drift the changelog can't see, and it makes the node an exact mirror of the control plane.
@@ -23,9 +24,9 @@ Already in place:
 | 2 | Control plane: Postgres, validation, REST API, changelog | ✅ Done |
 | 3 | Replication to nodes, SOA REFRESH/RETRY/EXPIRE | ✅ Done |
 | 4 | LuaJIT tailoring | ✅ Done |
-| 5 | ALIAS (in-zone targets) | Next |
-| 6 | Ops: metrics, RRL, cookies, anycast health | |
-| 7 | MCP server over the API | |
+| 5 | ALIAS (in-zone targets) | Skipped for now |
+| 6 | Ops: metrics, RRL, cookies, anycast health | ✅ Done |
+| 7 | MCP server over the API | Next |
 
 ## LUA records
 
@@ -81,6 +82,59 @@ Answers that don't come from a script carry ECS scope 0, so resolvers can cache 
 cargo test --release -p dns-server -- --ignored --nocapture script_latency
 ```
 
+## Operations
+
+Node flags for running in production:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--http ADDR` | off | Serves `/metrics` (Prometheus) and `/health` |
+| `--rrl-rps N` | off | Response rate limit: identical responses per second per client network |
+| `--rrl-slip N` | 2 | Send every Nth rate-limited response truncated instead of dropping it (0 = drop all) |
+| `--cookie-secret HEX` | random | 32 hex digits. Give every node behind one anycast address the same secret. |
+
+**Health:** `GET /health` returns 200 while the node serves at least one zone that hasn't expired, and 503 otherwise. The JSON body includes zone counts, `applied_seq` and the time since the last sync.
+
+An anycast speaker should withdraw the node's route while the check fails. That happens on its own when a node is cut off from the control plane for longer than its zones' EXPIRE. For example, with ExaBGP's health-check process:
+
+```
+process dns-health {
+    run python3 -m exabgp healthcheck --cmd "curl -sf http://127.0.0.1:9153/health" --ip 192.0.2.53/32 --interval 1 --rise 3 --fall 2;
+    encoder text;
+}
+```
+
+**Metrics:**
+- `dns_queries_total{transport,rcode}`
+- `dns_query_duration_seconds`: a histogram of the time spent building each answer
+- truncations, RRL drops and slips, valid cookies
+- Lua runs and errors
+- follower errors and REFRESH repairs
+- gauges: `dns_zones`, `dns_zones_expired`, `dns_healthy`, `dns_follow_applied_seq`, `dns_follow_sync_age_seconds`
+
+**Response rate limiting** works like BIND's RRL:
+- Responses are counted per token bucket. A bucket covers one client network (IPv4 /24, IPv6 /56), one response name, one query type and one response code.
+- Negative answers count against the zone rather than the name, so a flood of random subdomains shares one bucket.
+- Over the limit, responses are dropped, except every `--rrl-slip`th one, which is sent truncated so a real client can retry over TCP.
+- TCP queries and clients presenting a valid server cookie are never limited.
+
+**DNS cookies** follow RFC 7873, with RFC 9018 server cookies (SipHash-2-4 with a timestamp, valid for an hour). Cookies are optional: a missing or invalid server cookie gets a fresh cookie and a normal answer. A malformed cookie option gets FORMERR.
+
+**Load test** with `dns-server/examples/loadgen.rs`, a closed-loop UDP client. These numbers come from one 10-core Mac, with the client and the node sharing the machine:
+
+| Answer type | Client threads | QPS | p50 | p99 | p99.9 |
+|---|---|---|---|---|---|
+| Static | 4 | 98,759 | 37µs | 82µs | 106µs |
+| `LUA` script | 4 | 84,975 | 43µs | 91µs | 122µs |
+| Static | 16 | 73,308 | 211µs | 400µs | 557µs |
+| `LUA` script | 16 | 78,548 | 196µs | 386µs | 675µs |
+
+With more client threads, throughput levels off around 71–78k QPS on macOS, because every worker shares one UDP socket. On Linux, one `SO_REUSEPORT` socket per core is the next step (marked in the code). On the server side, 99.98% of 1.55M queries took under 100µs to answer.
+
+```bash
+cargo run --release -p dns-server --example loadgen -- 127.0.0.1:5300 10 4 www.example.com/A
+```
+
 ## Layout
 
 A Cargo workspace with two crates:
@@ -91,6 +145,10 @@ A Cargo workspace with two crates:
   - `src/lookup.rs`: authoritative answer logic
   - `src/follow.rs`: changelog follower (polling, atomic apply, sync state) and SOA REFRESH/RETRY checks
   - `src/script.rs`: LuaJIT sandbox for `LUA` records
+  - `src/metrics.rs`: Prometheus metrics, health check, HTTP endpoint
+  - `src/rrl.rs`: response rate limiting
+  - `src/cookie.rs`: DNS cookies (RFC 7873 / 9018)
+  - `examples/loadgen.rs`: UDP load generator
   - `testdata/`: test zones and `cases.txt`, the golden answer file (a query followed by its expected response, checked by `cargo test`)
 - `control-plane/`: the REST API over Postgres
   - `src/api.rs`: routes, transactions, serial bumps, changelog
@@ -173,6 +231,7 @@ Flags:
 - `--listen ADDR`: default `127.0.0.1:5300`; port 53 needs root.
 - `--poll-ms N`: changelog poll interval, default 1000.
 - `--node-id ID`: the name scripts see as `q.node`, default `$HOSTNAME`.
+- See [Operations](#operations) for `--http`, `--rrl-rps`, `--rrl-slip` and `--cookie-secret`.
 
 ```bash
 dig @127.0.0.1 -p 5300 www.example.com A
@@ -186,7 +245,7 @@ cargo run -p dns-server -- load ./db dns-server/testdata/example.com.zone
 
 ### Multi-node test
 
-Builds the image, starts Postgres, the control plane (on host port 8054) and two DNS nodes (on host ports 5301 and 5302), then checks propagation, REFRESH repair, `LUA` scripts on each node, expiry and recovery:
+Builds the image, starts Postgres, the control plane (on host port 8054) and two DNS nodes (on host ports 5301 and 5302), then checks propagation, REFRESH repair, `LUA` scripts on each node, health, metrics, cross-node cookies, expiry and recovery. Node metrics are on host ports 9301 and 9302:
 
 ```bash
 ./scripts/multinode-test.sh
