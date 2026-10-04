@@ -1,0 +1,9 @@
+[package]
+name = "dns-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heed = "0.22.1"
+hickory-proto = "0.26"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

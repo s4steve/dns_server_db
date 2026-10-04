@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: dns
+      POSTGRES_PASSWORD: dns # local development only
+      POSTGRES_DB: dns
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dns"]
+      interval: 2s
+      retries: 15
+
+volumes:
+  pgdata:
