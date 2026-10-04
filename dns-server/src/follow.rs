@@ -137,6 +137,9 @@ fn to_records(name: &Name, recs: &[Rec]) -> Result<Vec<Record>> {
 }
 
 fn to_record(name: &Name, r: &Rec) -> Result<Record> {
+    if r.rtype == "LUA" {
+        return Ok(crate::script::lua_record(name, r.ttl, &r.data)?);
+    }
     let rtype = RecordType::from_str(&r.rtype)?;
     let data = RData::try_from_str(rtype, &r.data)
         .map_err(|e| format!("{name} {rtype} {:?}: {e}", r.data))?;

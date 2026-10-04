@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 heed = "0.22.1"
 hickory-proto = "0.26"
+mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 ureq = { version = "3.4.2", features = ["json"] }

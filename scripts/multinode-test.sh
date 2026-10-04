@@ -3,7 +3,8 @@
 #   1. A change made through the API is answered by both nodes within 5 seconds.
 #   2. SOA REFRESH: a node whose copy of a zone drifts (here: edited behind its back) is
 #      repaired within REFRESH, and a zone the control plane doesn't have is removed.
-#   3. With the control plane gone, nodes keep serving until the zone's SOA EXPIRE passes,
+#   3. LUA scripts run on every node: per-node answers (q.node) and per-subnet answers (ECS).
+#   4. With the control plane gone, nodes keep serving until the zone's SOA EXPIRE passes,
 #      then SERVFAIL. When it comes back, they catch up and serve again.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -86,6 +87,22 @@ EOF
 t=$(wait_for $(( REFRESH + 5 )) bash -c '[[ "$(dig @127.0.0.1 -p 5302 +norec +tries=1 +time=1 www.rogue.test. A | sed -n "s/.*status: \([A-Z]*\).*/\1/p")" == REFUSED ]]') \
   || fail "rogue zone not removed"
 echo "   removed after $t"
+
+echo "== LUA: per-node and per-subnet answers"
+api -X POST "$API/zones/$ZONE/changes" -d @- >/dev/null <<'EOF'
+{"changes":[
+  {"action":"add","name":"whoami","type":"LUA","data":"TXT return '\"' .. q.node .. '\"'"},
+  {"action":"add","name":"geo","type":"LUA","data":"A if in_cidr(q.client, '10.0.0.0/8') then return '192.0.2.10' end return '192.0.2.20'"}]}
+EOF
+txt() { dig @127.0.0.1 -p "$1" +norec +tries=1 +time=1 +short "whoami.$ZONE" TXT; }
+both_named() { [[ "$(txt 5301)" == '"node1"' && "$(txt 5302)" == '"node2"' ]]; }
+t=$(wait_for 5 both_named) || fail "whoami: got $(txt 5301) / $(txt 5302)"
+echo "   whoami: node1 says $(txt 5301), node2 says $(txt 5302) (after $t)"
+inside=$(dig @127.0.0.1 -p 5301 +short +subnet=10.1.2.0/24 "geo.$ZONE" A)
+outside=$(dig @127.0.0.1 -p 5301 +short +subnet=203.0.113.0/24 "geo.$ZONE" A)
+scope=$(dig @127.0.0.1 -p 5301 +subnet=10.1.2.0/24 "geo.$ZONE" A | grep -o 'CLIENT-SUBNET: [0-9./]*')
+[[ "$inside" == 192.0.2.10 && "$outside" == 192.0.2.20 ]] || fail "geo: got $inside / $outside"
+echo "   geo: 10.1.2.0/24 gets $inside, 203.0.113.0/24 gets $outside ($scope)"
 
 echo "== cut off: stop the control plane"
 docker compose stop control-plane >/dev/null

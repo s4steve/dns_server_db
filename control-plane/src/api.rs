@@ -550,7 +550,7 @@ async fn apply_changes(
                     )
                     .bind(row.id)
                     .bind(name.to_string())
-                    .bind(rtype.to_string())
+                    .bind(validate::type_name(*rtype))
                     .fetch_optional(&mut *tx)
                     .await?
                     .unwrap_or(row.default_ttl),
@@ -561,7 +561,7 @@ async fn apply_changes(
                 )
                 .bind(row.id)
                 .bind(name.to_string())
-                .bind(rtype.to_string())
+                .bind(validate::type_name(*rtype))
                 .bind(ttl)
                 .bind(data)
                 .execute(&mut *tx)
@@ -575,7 +575,7 @@ async fn apply_changes(
                 )
                 .bind(row.id)
                 .bind(name.to_string())
-                .bind(rtype.to_string())
+                .bind(validate::type_name(*rtype))
                 .bind(data)
                 .execute(&mut *tx)
                 .await?
@@ -602,8 +602,8 @@ async fn apply_changes(
         .collect();
 
     for name in &touched {
-        let records: Vec<(String, i32)> =
-            sqlx::query_as("SELECT type, ttl FROM records WHERE zone_id = $1 AND name = $2")
+        let records: Vec<(String, i32, String)> =
+            sqlx::query_as("SELECT type, ttl, data FROM records WHERE zone_id = $1 AND name = $2")
                 .bind(row.id)
                 .bind(name)
                 .fetch_all(&mut *tx)
@@ -616,9 +616,11 @@ async fn apply_changes(
                 ));
             }
         }
-        let records: Vec<(RecordType, u32)> = records
+        let records: Vec<(RecordType, u32, &str)> = records
             .iter()
-            .filter_map(|(t, ttl)| Some((validate::parse_type(t).ok()?, *ttl as u32)))
+            .filter_map(|(t, ttl, data)| {
+                Some((validate::parse_type(t).ok()?, *ttl as u32, data.as_str()))
+            })
             .collect();
         errors.extend(validate::check_name(&zone, &owner, &records));
     }

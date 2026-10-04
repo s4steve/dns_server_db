@@ -1,11 +1,13 @@
 //! Authoritative answer logic (RFC 1034 §4.3.2, RFC 2308, RFC 4592), with no recursion.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 
 use heed::RoTxn;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
+use crate::script::{self, Outcome};
 use crate::store::{Result, Store};
 
 const MAX_CNAME_CHAIN: usize = 8;
@@ -17,17 +19,34 @@ pub struct Answer {
     pub answers: Vec<Record>,
     pub authority: Vec<Record>,
     pub additional: Vec<Record>,
+    /// A script produced (part of) the answer, so it may depend on the client's subnet.
+    pub tailored: bool,
+}
+
+/// Who is asking, as far as scripts are concerned.
+pub struct Client<'a> {
+    /// ECS address if the resolver sent one, else the packet's source IP.
+    pub addr: IpAddr,
+    pub prefix: u8,
+    pub source: IpAddr,
+    pub node: &'a str,
 }
 
 enum Step {
-    Found(Vec<Record>),
+    /// Records, and whether a script made them.
+    Found(Vec<Record>, bool),
+    /// A script failed and there is no static answer to fall back to.
+    ServFail,
     Cname(Record, Name),
-    Referral { ns: Vec<Record>, glue: Vec<Record> },
+    Referral {
+        ns: Vec<Record>,
+        glue: Vec<Record>,
+    },
     NoData,
     NxDomain,
 }
 
-pub fn lookup(store: &Store, qname: &Name, qtype: RecordType) -> Result<Answer> {
+pub fn lookup(store: &Store, qname: &Name, qtype: RecordType, client: &Client) -> Result<Answer> {
     let txn = store.read_txn()?;
     let mut ans = Answer {
         rcode: ResponseCode::NoError,
@@ -35,6 +54,7 @@ pub fn lookup(store: &Store, qname: &Name, qtype: RecordType) -> Result<Answer> 
         answers: vec![],
         authority: vec![],
         additional: vec![],
+        tailored: false,
     };
     let mut name = qname.clone();
     let mut seen = HashSet::new();
@@ -54,14 +74,21 @@ pub fn lookup(store: &Store, qname: &Name, qtype: RecordType) -> Result<Answer> 
             ans.answers.clear();
             return Ok(ans);
         }
-        let step = step(store, &txn, &zone, &name, qtype)?;
+        let step = step(store, &txn, &zone, &name, qtype, client)?;
         // AA describes the original qname (RFC 1034 §6.2.7): only a referral at the first hop clears it.
         if hop == 0 {
             ans.authoritative = !matches!(step, Step::Referral { .. });
         }
         match step {
-            Step::Found(records) => {
+            Step::Found(records, tailored) => {
                 ans.answers.extend(records);
+                ans.tailored |= tailored;
+                return Ok(ans);
+            }
+            Step::ServFail => {
+                ans.rcode = ResponseCode::ServFail;
+                ans.authoritative = false;
+                ans.answers.clear();
                 return Ok(ans);
             }
             Step::Cname(record, target) => {
@@ -91,10 +118,19 @@ pub fn lookup(store: &Store, qname: &Name, qtype: RecordType) -> Result<Answer> 
     Ok(ans) // chain longer than MAX_CNAME_CHAIN: return what we have
 }
 
-fn step(store: &Store, txn: &RoTxn, zone: &Name, qname: &Name, qtype: RecordType) -> Result<Step> {
+fn step(
+    store: &Store,
+    txn: &RoTxn,
+    zone: &Name,
+    qname: &Name,
+    qtype: RecordType,
+    client: &Client,
+) -> Result<Step> {
     if qname == zone {
-        let recs = store.records(txn, zone, zone)?.ok_or("zone apex has no records")?;
-        return Ok(at_node(recs, qtype));
+        let recs = store
+            .records(txn, zone, zone)?
+            .ok_or("zone apex has no records")?;
+        return Ok(at_node(recs, qname, qtype, client));
     }
 
     // Walk down from just below the apex to qname, stopping at a zone cut or a missing name.
@@ -108,7 +144,7 @@ fn step(store: &Store, txn: &RoTxn, zone: &Name, qname: &Name, qtype: RecordType
             Some(recs) if recs.iter().any(|r| r.record_type() == RecordType::NS) => {
                 return referral(store, txn, zone, recs);
             }
-            Some(recs) if depth == labels.len() => return Ok(at_node(recs, qtype)),
+            Some(recs) if depth == labels.len() => return Ok(at_node(recs, qname, qtype, client)),
             Some(_) => encloser = node,
             None if store.exists(txn, zone, &node)? => {
                 if depth == labels.len() {
@@ -127,24 +163,61 @@ fn step(store: &Store, txn: &RoTxn, zone: &Name, qname: &Name, qtype: RecordType
             for r in &mut recs {
                 r.name = qname.clone();
             }
-            Ok(at_node(recs, qtype))
+            Ok(at_node(recs, qname, qtype, client))
         }
         None => Ok(Step::NxDomain),
     }
 }
 
-fn at_node(recs: Vec<Record>, qtype: RecordType) -> Step {
-    let cname = recs.iter().find(|r| r.record_type() == RecordType::CNAME).cloned();
+fn at_node(recs: Vec<Record>, qname: &Name, qtype: RecordType, client: &Client) -> Step {
+    // LUA records are never served themselves; they only run.
+    let (scripts, recs): (Vec<Record>, Vec<Record>) = recs
+        .into_iter()
+        .partition(|r| r.record_type() == script::LUA);
+    if qtype != RecordType::ANY {
+        let found = scripts.iter().find_map(|r| {
+            script::decode_lua(r)
+                .filter(|(t, _)| *t == qtype)
+                .map(|(_, src)| (r.ttl, src))
+        });
+        if let Some((ttl, source)) = found {
+            let statics: Vec<Record> = recs
+                .iter()
+                .filter(|r| r.record_type() == qtype)
+                .cloned()
+                .collect();
+            match tailor(source, ttl, qname, qtype, client, &statics) {
+                Ok(Some(records)) => return Step::Found(records, true),
+                Ok(None) => {} // script declined: answer from the static records below
+                Err(e) => {
+                    // ponytail: logs every failure; rate-limit if a broken script floods logs.
+                    eprintln!("LUA {qname} {qtype}: {e}");
+                    return if statics.is_empty() {
+                        Step::ServFail
+                    } else {
+                        Step::Found(statics, false)
+                    };
+                }
+            }
+        }
+    }
+
+    let cname = recs
+        .iter()
+        .find(|r| r.record_type() == RecordType::CNAME)
+        .cloned();
     let matching: Vec<Record> = recs
         .into_iter()
         .filter(|r| qtype == RecordType::ANY || r.record_type() == qtype)
         .collect();
     if !matching.is_empty() {
-        return Step::Found(matching);
+        return Step::Found(matching, false);
     }
     match cname {
         Some(r) => {
-            let RData::CNAME(target) = &r.data else { unreachable!() };
+            let RData::CNAME(target) = &r.data else {
+                unreachable!()
+            };
             let target = target.0.clone();
             Step::Cname(r, target)
         }
@@ -152,8 +225,45 @@ fn at_node(recs: Vec<Record>, qtype: RecordType) -> Step {
     }
 }
 
+/// Runs a script. `Ok(None)` means it returned nothing; anything unusable is an error.
+fn tailor(
+    source: &str,
+    ttl: u32,
+    qname: &Name,
+    qtype: RecordType,
+    client: &Client,
+    statics: &[Record],
+) -> std::result::Result<Option<Vec<Record>>, String> {
+    let qname_text = qname.to_lowercase().to_string();
+    let qtype_text = qtype.to_string();
+    let input = script::Input {
+        qname: &qname_text,
+        qtype: &qtype_text,
+        client: client.addr,
+        client_prefix: client.prefix,
+        source: client.source,
+        node: client.node,
+        statics: statics.iter().map(|r| r.data.to_string()).collect(),
+    };
+    match script::run(source, &input) {
+        Outcome::Answer(items) => items
+            .iter()
+            .map(|text| {
+                RData::try_from_str(qtype, text)
+                    .map(|data| Some(Record::from_rdata(qname.clone(), ttl, data)))
+                    .map_err(|e| format!("returned {text:?}, not valid {qtype} data: {e}"))
+            })
+            .collect::<std::result::Result<Option<Vec<_>>, _>>(),
+        Outcome::Empty => Ok(None),
+        Outcome::Error(e) => Err(e),
+    }
+}
+
 fn referral(store: &Store, txn: &RoTxn, zone: &Name, recs: Vec<Record>) -> Result<Step> {
-    let ns: Vec<Record> = recs.into_iter().filter(|r| r.record_type() == RecordType::NS).collect();
+    let ns: Vec<Record> = recs
+        .into_iter()
+        .filter(|r| r.record_type() == RecordType::NS)
+        .collect();
     let mut glue = vec![];
     for r in &ns {
         let RData::NS(target) = &r.data else { continue };
@@ -174,7 +284,9 @@ fn referral(store: &Store, txn: &RoTxn, zone: &Name, recs: Vec<Record>) -> Resul
 
 /// The zone's SOA with TTL = min(SOA TTL, SOA MINIMUM), per RFC 2308 §5.
 fn negative_soa(store: &Store, txn: &RoTxn, zone: &Name) -> Result<Record> {
-    let recs = store.records(txn, zone, zone)?.ok_or("zone apex has no records")?;
+    let recs = store
+        .records(txn, zone, zone)?
+        .ok_or("zone apex has no records")?;
     let mut soa = recs
         .into_iter()
         .find(|r| r.record_type() == RecordType::SOA)

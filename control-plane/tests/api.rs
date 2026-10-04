@@ -171,6 +171,12 @@ async fn changesets_validate_bump_serial_and_reach_the_changelog() {
             json!([add("x", "SOA", "a. b. 1 2 3 4 5")]),
             "SOA is managed through the zone",
         ),
+        (
+            json!([add("alias", "LUA", "A return '192.0.2.1'")]),
+            "CNAME cannot coexist",
+        ),
+        (json!([add("geo", "LUA", "A return (")]), "does not compile"),
+        (json!([add("geo", "LUA", "NS return 'x.'")]), "can answer"),
         // One good change plus one bad one: the good one must not be applied either.
         (
             json!([
@@ -209,6 +215,22 @@ async fn changesets_validate_bump_serial_and_reach_the_changelog() {
         log_after(&app, &zone, start).await.len(),
         1,
         "rejected changes must not log"
+    );
+
+    // LUA records go through the same path and reach the changelog as type "LUA".
+    let script = "A if in_cidr(q.client, '10.0.0.0/8') then return '192.0.2.10' end";
+    let (status, body) = call(
+        &app,
+        "POST",
+        &changes,
+        Some(json!({ "changes": [add("geo", "LUA", script)] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let log = log_after(&app, &zone, start).await;
+    assert_eq!(
+        log.last().unwrap()["payload"][format!("geo.{zone}")],
+        json!([{ "type": "LUA", "ttl": 300, "data": script }])
     );
 
     // Deleting a name's last record logs it with an empty set, so nodes remove it.
