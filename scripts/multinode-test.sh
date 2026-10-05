@@ -5,7 +5,7 @@
 #      repaired within REFRESH, and a zone the control plane doesn't have is removed.
 #   3. LUA scripts run on every node: per-node answers (q.node) and per-subnet answers (ECS).
 #   4. Ops: /health and /metrics on each node; a DNS cookie from one node validates on the
-#      other (shared --cookie-secret, as behind anycast).
+#      other (shared COOKIE_SECRET, as behind anycast).
 #   5. With the control plane gone, nodes keep serving until the zone's SOA EXPIRE passes,
 #      then SERVFAIL (and count the zone as expired). When it comes back, they catch up.
 set -euo pipefail

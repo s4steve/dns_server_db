@@ -190,8 +190,7 @@ fn at_node(recs: Vec<Record>, qname: &Name, qtype: RecordType, client: &Client) 
                 Ok(Some(records)) => return Step::Found(records, true),
                 Ok(None) => {} // script declined: answer from the static records below
                 Err(e) => {
-                    // ponytail: logs every failure; rate-limit if a broken script floods logs.
-                    eprintln!("LUA {qname} {qtype}: {e}");
+                    crate::warn(format_args!("LUA {qname} {qtype}: {e}"));
                     return if statics.is_empty() {
                         Step::ServFail
                     } else {

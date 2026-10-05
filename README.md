@@ -193,7 +193,7 @@ A token's role on a zone is the highest role among its matching grants:
 - A zone the token can't see returns 404, so its existence doesn't leak.
 - A zone it can see, but lacks the role for, returns 403.
 
-**Minting the first admin token:** run the `create-token` subcommand against the database. It prints the secret, which is shown only once:
+**Minting the first admin token:** run the `create-token` subcommand against the database (`DATABASE_URL` must be set, see [Running](#running)). It prints the secret, which is shown only once:
 
 ```bash
 TOKEN=$(cargo run -q -p control-plane -- create-token --name ops-admin --admin)
@@ -205,7 +205,7 @@ The same command creates scoped tokens, such as one for DNS nodes (read-only, ev
 cargo run -q -p control-plane -- create-token --name dns-nodes --grant '*:viewer'
 ```
 
-Add `--secret VALUE` to register a value you already have, which suits configuration management, and `--if-missing` to make the command safe to re-run.
+To register a value you already have, which suits configuration management, add `--secret-env VAR` to read it from an environment variable. (`--secret VALUE` also works, but the value shows up in `ps` and shell history.) Add `--if-missing` to make the command safe to re-run.
 
 **Managing tokens over the API** (admin only):
 - `POST /tokens` with `{"name", "admin", "grants": [{"pattern", "role", "scripts"}], "expires_in_days"}` returns the secret once.
@@ -235,7 +235,7 @@ Node flags for running in production:
 | `--http ADDR` | off | Serves `/metrics` (Prometheus) and `/health` |
 | `--rrl-rps N` | off | Response rate limit: identical responses per second per client network |
 | `--rrl-slip N` | 2 | Send every Nth rate-limited response truncated instead of dropping it (0 = drop all) |
-| `--cookie-secret HEX` | random | 32 hex digits. Give every node behind one anycast address the same secret. |
+| `COOKIE_SECRET` (env) | random | 32 hex digits. Give every node behind one anycast address the same secret. `--cookie-secret HEX` also works, but flags show up in `ps`. |
 | `--map-size-mb N` | 1024 | LMDB map size. If the data outgrows it, writes fail and the node stops following, so watch `dns_follow_errors_total`. |
 
 **Health:** `GET /health` returns 200 while the node serves at least one zone that hasn't expired, and 503 otherwise. The JSON body includes zone counts, `applied_seq` and the time since the last sync.
@@ -311,7 +311,7 @@ A Cargo workspace with three crates:
   - `src/main.rs`: JSON-RPC handling, tool definitions, HTTP calls
   - `tests/mcp.rs`: drives the binary over stdio against a real control plane
 - `scripts/multinode-test.sh`: Docker end-to-end test: propagation, expiry, recovery
-- `Dockerfile`, `docker-compose.yml`: one image with both binaries; the `multinode` compose profile runs the control plane plus two DNS nodes
+- `Dockerfile`, `docker-compose.yml`: one image with both binaries; the `multinode` compose profile runs the control plane plus two DNS nodes. Containers run as an unprivileged user, so nodes listen on 5300 inside the container; map host port 53 to it.
 
 ## Running
 
@@ -323,6 +323,12 @@ Start Postgres:
 docker compose up -d
 ```
 
+The control plane needs `DATABASE_URL`; it has no default, so a deployment can't silently fall back to these development credentials:
+
+```bash
+export DATABASE_URL=postgres://dns:dns@127.0.0.1:5432/dns
+```
+
 Run all tests (the control-plane test needs Postgres running):
 
 ```bash
@@ -331,7 +337,7 @@ cargo test
 
 ### Control plane
 
-Listens on `127.0.0.1:8053`. Override with the `LISTEN` and `DATABASE_URL` environment variables. Every request needs a token; mint the first one with `create-token` (see [Access control](#access-control)).
+Listens on `127.0.0.1:8053`; override with the `LISTEN` environment variable. `DATABASE_URL` is required. Every request needs a token; mint the first one with `create-token` (see [Access control](#access-control)).
 
 The API serves plain HTTP. Anywhere beyond localhost, put it behind a reverse proxy that terminates TLS and rate-limits clients, and point nodes and the MCP server at `https://`. Tokens, and the changelog with its `LUA` scripts, would otherwise cross the network in the clear.
 
@@ -403,7 +409,7 @@ Flags:
 - `--listen ADDR`: default `127.0.0.1:5300`; port 53 needs root.
 - `--poll-ms N`: changelog poll interval, default 1000.
 - `--node-id ID`: the name scripts see as `q.node`, default `$HOSTNAME`.
-- See [Operations](#operations) for `--http`, `--rrl-rps`, `--rrl-slip` and `--cookie-secret`.
+- See [Operations](#operations) for `--http`, `--rrl-rps`, `--rrl-slip`, `--map-size-mb` and `COOKIE_SECRET`.
 
 ```bash
 dig @127.0.0.1 -p 5300 www.example.com A

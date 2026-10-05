@@ -89,7 +89,10 @@ impl Rrl {
         }
         let key = h.finish();
 
-        let mut shard = self.shards[key as usize % SHARDS].lock().unwrap();
+        // A poisoned shard is still a valid map; never let one panic break every later packet.
+        let mut shard = self.shards[key as usize % SHARDS]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if shard.len() >= MAX_BUCKETS_PER_SHARD {
             // Idle buckets have refilled anyway; forgetting them changes nothing.
             shard.retain(|_, b| now.duration_since(b.last).as_secs_f64() * self.rps < self.rps);

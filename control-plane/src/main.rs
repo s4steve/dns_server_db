@@ -2,13 +2,15 @@ use control_plane::auth::{self, Grant};
 use tokio::net::TcpListener;
 
 const USAGE: &str = "usage:
-  control-plane                serve the API (LISTEN, DATABASE_URL, SPF_REFRESH_SECS=900)
+  control-plane                serve the API (DATABASE_URL required; LISTEN, SPF_REFRESH_SECS=900)
   control-plane create-token --name NAME [--admin] [--grant PATTERN:ROLE[:scripts]]...
-                             [--secret VALUE] [--if-missing]
+                             [--secret-env VAR | --secret VALUE] [--if-missing]
 
   create-token prints the new token's secret. Use it to mint the first admin token.
   --grant      e.g. 'example.com:editor', '*.team.test:owner:scripts', '*:viewer' (DNS nodes)
-  --secret     register this value instead of a random one (automation; 32+ characters)
+  --secret-env register the value of environment variable VAR instead of a random one
+               (automation; 32+ characters)
+  --secret     the same, given directly; it shows up in ps and shell history, so prefer --secret-env
   --if-missing leave an existing token with this name alone (prints nothing)";
 
 fn usage() -> ! {
@@ -18,8 +20,14 @@ fn usage() -> ! {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://dns:dns@127.0.0.1:5432/dns".into());
+    // No default: falling back to well-known credentials is how a misconfigured deployment
+    // ends up talking to the wrong database.
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        eprintln!(
+            "set DATABASE_URL (for the compose Postgres: postgres://dns:dns@127.0.0.1:5432/dns)\n\n{USAGE}"
+        );
+        std::process::exit(2);
+    });
     let args: Vec<String> = std::env::args().skip(1).collect();
     let pool = control_plane::connect(&database_url).await?;
 
@@ -58,6 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(2)
                     })),
                     "--secret" => secret = Some(value()),
+                    "--secret-env" => {
+                        let var = value();
+                        secret = Some(std::env::var(&var).unwrap_or_else(|_| {
+                            eprintln!("--secret-env: environment variable {var} is not set");
+                            std::process::exit(2)
+                        }))
+                    }
                     "--if-missing" => if_missing = true,
                     _ => usage(),
                 }

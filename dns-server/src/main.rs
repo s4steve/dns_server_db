@@ -37,6 +37,27 @@ pub enum Transport {
     Tcp = 1,
 }
 
+/// eprintln! for errors that queries can trigger, at most WARN_LINES_PER_SEC lines a second,
+/// so a flood of bad queries can't fill the disk. Suppressed lines are counted and reported.
+// ponytail: one shared budget for every caller; per-message budgets if one noisy source
+// ever hides the others.
+pub fn warn(line: std::fmt::Arguments) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    const WARN_LINES_PER_SEC: u64 = 10;
+    static SECOND: AtomicU64 = AtomicU64::new(0);
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    let now = store::now();
+    if SECOND.swap(now, Relaxed) != now {
+        let suppressed = LINES.swap(0, Relaxed).saturating_sub(WARN_LINES_PER_SEC);
+        if suppressed > 0 {
+            eprintln!("({suppressed} more warnings suppressed)");
+        }
+    }
+    if LINES.fetch_add(1, Relaxed) < WARN_LINES_PER_SEC {
+        eprintln!("{line}");
+    }
+}
+
 /// This node's ID, handed to scripts as `q.node` (`--node-id`).
 static NODE_ID: OnceLock<String> = OnceLock::new();
 
@@ -171,7 +192,7 @@ fn answer(
             resp.additionals = a.additional;
         }
         Err(e) => {
-            eprintln!("lookup {} {}: {e}", q.name(), q.query_type());
+            warn(format_args!("lookup {} {}: {e}", q.name(), q.query_type()));
             resp.metadata.response_code = ResponseCode::ServFail;
         }
     }
@@ -222,7 +243,11 @@ async fn serve_udp(srv: Arc<Server>, sock: Arc<UdpSocket>) {
         let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
             continue;
         };
-        if let Some(resp) = handle(&srv, &buf[..n], Transport::Udp, peer.ip()) {
+        // A panic answering one packet must not end this worker: nothing would restart it.
+        let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle(&srv, &buf[..n], Transport::Udp, peer.ip())
+        }));
+        if let Ok(Some(resp)) = resp {
             let _ = sock.send_to(&resp, peer).await;
         }
     }
@@ -265,7 +290,7 @@ async fn serve(srv: Arc<Server>, addr: &str) -> std::io::Result<()> {
         let stream = match tcp.accept().await {
             Ok((stream, _)) => stream,
             Err(e) => {
-                eprintln!("tcp accept: {e}");
+                warn(format_args!("tcp accept: {e}"));
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
@@ -307,7 +332,8 @@ const USAGE: &str = "usage:
   --rrl-rps N           response rate limit per client block and response (default: off)
   --rrl-slip N          send every Nth limited response truncated instead of dropping it
                         (default 2; 0 = drop all)
-  --cookie-secret HEX   32 hex digits; share it across anycast nodes (default: random)
+  --cookie-secret HEX   32 hex digits; share it across anycast nodes (default: random).
+                        Prefer the COOKIE_SECRET environment variable: flags show up in ps
   --map-size-mb N       LMDB map size; writes fail once the data outgrows it (default 1024)";
 
 /// Whether `url` is safe to send the token and changelog to: `https://`, or plain `http://`
@@ -377,6 +403,11 @@ async fn main() -> store::Result<()> {
                         secret = Some(cookie::parse_secret(v).unwrap_or_else(|| usage()))
                     }
                     _ => usage(),
+                }
+            }
+            if secret.is_none() {
+                if let Ok(v) = std::env::var("COOKIE_SECRET") {
+                    secret = Some(cookie::parse_secret(&v).unwrap_or_else(|| usage()));
                 }
             }
             let _ = NODE_ID.set(std::env::var("HOSTNAME").unwrap_or_default());

@@ -88,7 +88,10 @@ const MAX_REP_BYTES: usize = 64 * 1024;
 /// Wall-clock limit per call, including time in C functions. Well-behaved scripts take
 /// microseconds; this only has to stay under resolvers' retry timeouts.
 const TIME_LIMIT: Duration = Duration::from_millis(100);
-// ponytail: unbounded per-thread compile cache; scripts are few. Evict if that changes.
+/// Compiled scripts kept per runner. Past this the cache starts over, so scripts that were
+/// edited or deleted don't pile up for the life of the process.
+// ponytail: clear-all eviction; an LRU only if a node serves more distinct scripts than this.
+const MAX_CACHED_SCRIPTS: usize = 1000;
 
 #[derive(Clone)]
 pub struct Input {
@@ -155,7 +158,13 @@ thread_local! {
 static DISABLED: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(Default::default);
 
 pub fn run(source: &str, input: &Input) -> Outcome {
-    if DISABLED.read().unwrap().contains(source) {
+    // The read guard is a temporary of the condition, so it's released before the call
+    // below, which may need the write lock.
+    if DISABLED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(source)
+    {
         return Outcome::Error("disabled on this node after exceeding the time limit".into());
     }
     RUNNER.with(|cell| {
@@ -181,7 +190,10 @@ pub fn run(source: &str, input: &Input) -> Outcome {
                 // Abandon the stuck runner (it exits if the call ever returns) and disable the
                 // script so it can't strand another one.
                 *slot = None;
-                DISABLED.write().unwrap().insert(source.to_string());
+                DISABLED
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(source.to_string());
                 crate::metrics::inc(&crate::metrics::LUA_TIMEOUTS);
                 Outcome::Error(format!(
                     "exceeded the {}ms time limit; disabled on this node",
@@ -300,6 +312,9 @@ impl Engine {
                 .set_mode(ChunkMode::Text) // LuaJIT doesn't verify bytecode
                 .set_environment(env.clone())
                 .into_function()?;
+            if self.scripts.len() >= MAX_CACHED_SCRIPTS {
+                self.scripts.clear();
+            }
             self.scripts.insert(source.to_string(), (f, env));
         }
         let (f, env) = &self.scripts[source];

@@ -55,7 +55,13 @@ impl Cookies {
             let server = &option[8..];
             let stamp = u32::from_be_bytes(server[4..8].try_into().unwrap());
             let fresh = stamp <= now.wrapping_add(MAX_SKEW) && now.wrapping_sub(stamp) <= MAX_AGE;
-            server[0] == VERSION && fresh && server[8..] == self.hash(&client_cookie, stamp, client)
+            // Constant-time comparison, so response timing says nothing about the expected hash.
+            let expected = self.hash(&client_cookie, stamp, client);
+            let diff = server[8..]
+                .iter()
+                .zip(expected)
+                .fold(0, |acc, (a, b)| acc | (a ^ b));
+            server[0] == VERSION && fresh && diff == 0
         };
         let mut payload = client_cookie.to_vec();
         payload.extend_from_slice(&[VERSION, 0, 0, 0]);
