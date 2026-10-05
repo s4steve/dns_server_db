@@ -2,7 +2,9 @@
 
 use std::str::FromStr;
 
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::rdata::NULL;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
 /// `LUA` records hold a script that answers for one record type, as `"<TYPE> <script>"`.
 /// Nodes store them under this private-use type code (RFC 6895 §3.1) and never serve them.
@@ -39,6 +41,11 @@ pub fn type_name(t: RecordType) -> String {
 
 /// RFC 2181 §8: TTLs are unsigned 31-bit.
 const MAX_TTL: i64 = 2_147_483_647;
+/// Nodes store every record at a name as one wire-encoded value, which hickory caps at 64 KiB.
+/// This leaves room for the SOA nodes add at the apex. Anything a node can't store would halt
+/// its changelog follower, so it must be rejected here.
+const MAX_NAME_WIRE_BYTES: usize = 60_000;
+pub const MAX_SCRIPT_BYTES: usize = 16 * 1024;
 
 /// Parses a zone name into lowercase FQDN form.
 pub fn parse_zone(input: &str) -> Result<Name, String> {
@@ -114,6 +121,10 @@ pub fn parse_data(rtype: RecordType, input: &str) -> Result<String, String> {
             ));
         }
     }
+    // Must encode the way nodes store it (e.g. TXT strings are at most 255 bytes).
+    rdata
+        .to_bytes()
+        .map_err(|e| format!("invalid {rtype} data {input:?}: {e}"))?;
     let canonical = match &rdata {
         RData::TXT(txt) => txt
             .txt_data
@@ -150,8 +161,20 @@ fn parse_lua(input: &str) -> Result<String, String> {
             )
         })?;
     let script = script.trim();
+    if script.len() > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "LUA script is {} bytes; the limit is {MAX_SCRIPT_BYTES}",
+            script.len()
+        ));
+    }
+    // Text only: LuaJIT doesn't verify precompiled bytecode.
     mlua::Lua::new_with(mlua::StdLib::NONE, mlua::LuaOptions::default())
-        .and_then(|lua| lua.load(script).into_function().map(|_| ()))
+        .and_then(|lua| {
+            lua.load(script)
+                .set_mode(mlua::chunk::ChunkMode::Text)
+                .into_function()
+                .map(|_| ())
+        })
         .map_err(|e| format!("LUA script does not compile: {e}"))?;
     Ok(format!("{target} {script}"))
 }
@@ -216,7 +239,37 @@ pub fn check_name(zone: &Name, name: &Name, records: &[(RecordType, u32, &str)])
             errors.push(format!("{name}: only one LUA script may answer {target}"));
         }
     }
+    if wire_size(name, records).is_none_or(|n| n > MAX_NAME_WIRE_BYTES) {
+        errors.push(format!(
+            "{name}: its records together exceed {MAX_NAME_WIRE_BYTES} bytes, more than DNS nodes can store"
+        ));
+    }
     errors
+}
+
+/// The records' size as nodes store them (wire format, back to back); None if they can't be
+/// encoded. LUA data stands in for its stored form, which is never larger.
+fn wire_size(name: &Name, records: &[(RecordType, u32, &str)]) -> Option<usize> {
+    let mut buf = Vec::new();
+    let mut enc = BinEncoder::new(&mut buf);
+    for (rtype, ttl, data) in records {
+        let rdata = if *rtype == LUA {
+            RData::Unknown {
+                code: LUA,
+                rdata: NULL::with(data.as_bytes().to_vec()),
+            }
+        } else {
+            // Unparseable data is reported by parse_data; it isn't stored.
+            let Ok(rdata) = RData::try_from_str(*rtype, data) else {
+                continue;
+            };
+            rdata
+        };
+        Record::from_rdata(name.clone(), *ttl, rdata)
+            .emit(&mut enc)
+            .ok()?;
+    }
+    Some(buf.len())
 }
 
 #[cfg(test)]
@@ -283,6 +336,25 @@ mod tests {
         assert!(parse_type("SOA").is_err());
         assert!(parse_type("PTR").is_err());
         assert!(parse_ttl(-1).is_err());
+        // Nodes can't store a TXT string over 255 bytes.
+        assert!(parse_data(RecordType::TXT, &format!("\"{}\"", "x".repeat(256))).is_err());
+        assert!(parse_data(RecordType::TXT, &format!("\"{}\"", "x".repeat(255))).is_ok());
+    }
+
+    #[test]
+    fn rejects_names_nodes_cant_store() {
+        let z = zone();
+        let www = parse_name("www", &z).unwrap();
+        let txt = format!("\"{}\"", "x".repeat(250));
+        let recs: Vec<(RecordType, u32, &str)> = (0..300)
+            .map(|_| (RecordType::TXT, 300, txt.as_str()))
+            .collect();
+        assert!(
+            check_name(&z, &www, &recs)
+                .iter()
+                .any(|e| e.contains("exceed"))
+        );
+        assert!(check_name(&z, &www, &recs[..10]).is_empty());
     }
 
     #[test]
@@ -341,5 +413,14 @@ mod tests {
                 .contains("can answer")
         );
         assert!(parse_data(LUA, "A").is_err());
+        assert!(parse_data(LUA, &format!("A return '{}'", "x".repeat(MAX_SCRIPT_BYTES))).is_err());
+        // Precompiled bytecode is refused (only source text is accepted).
+        let bytecode = mlua::Lua::new()
+            .load("return 1")
+            .into_function()
+            .unwrap()
+            .dump(true);
+        let bytecode = String::from_utf8_lossy(&bytecode).into_owned();
+        assert!(parse_data(LUA, &format!("A {bytecode}")).is_err());
     }
 }

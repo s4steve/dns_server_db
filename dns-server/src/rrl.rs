@@ -93,6 +93,11 @@ impl Rrl {
         if shard.len() >= MAX_BUCKETS_PER_SHARD {
             // Idle buckets have refilled anyway; forgetting them changes nothing.
             shard.retain(|_, b| now.duration_since(b.last).as_secs_f64() * self.rps < self.rps);
+            if shard.len() >= MAX_BUCKETS_PER_SHARD / 2 {
+                // All busy (e.g. a spoofed flood): forget them rather than rescan on every
+                // packet. Forgetting only refills buckets, so limiting gets briefly laxer.
+                shard.clear();
+            }
         }
         let b = shard.entry(key).or_insert(Bucket {
             tokens: self.rps,
@@ -181,5 +186,20 @@ mod tests {
             .filter(|n| a("198.51.100.1", n, ResponseCode::Refused, t0) == Verdict::Send)
             .count();
         assert_eq!(sent, 5);
+
+        // A flood of fresh client blocks can't grow a shard past its cap.
+        for i in 0..(SHARDS * MAX_BUCKETS_PER_SHARD * 2) as u32 {
+            rrl.check_at(
+                IpAddr::from((i << 8).to_be_bytes()),
+                &www,
+                RecordType::A,
+                ResponseCode::NoError,
+                t0,
+            );
+        }
+        assert!(rrl
+            .shards
+            .iter()
+            .all(|s| s.lock().unwrap().len() <= MAX_BUCKETS_PER_SHARD));
     }
 }

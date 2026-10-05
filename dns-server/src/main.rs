@@ -26,6 +26,10 @@ use store::Store;
 const OUR_UDP_PAYLOAD: u16 = 1232;
 const PLAIN_UDP_LIMIT: u16 = 512;
 const COOKIE: u16 = 10; // EDNS option code (RFC 7873)
+/// A TCP connection that sends no complete query for this long is closed (RFC 7766 §6.2.3).
+const TCP_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+// ponytail: fixed cap; make it a flag if a node legitimately needs more concurrent TCP clients.
+const MAX_TCP_CONNS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -122,6 +126,11 @@ fn answer(
     resp.add_query(q.clone());
     if q.query_class() != DNSClass::IN {
         return done(resp, ResponseCode::Refused);
+    }
+    // ANY over UDP gets TC (RFC 8482 §4.4): a full answer would make a small spoofed query a
+    // large response. Real clients retry over TCP.
+    if q.query_type() == RecordType::ANY && transport == Transport::Udp {
+        return truncated(resp).map(|b| (b, ResponseCode::NoError));
     }
 
     // EDNS Client Subnet (RFC 7871): scripts see the resolver's client subnet when it sends one.
@@ -222,9 +231,16 @@ async fn serve_udp(srv: Arc<Server>, sock: Arc<UdpSocket>) {
 async fn serve_tcp_conn(srv: Arc<Server>, mut stream: TcpStream) -> std::io::Result<()> {
     let peer = stream.peer_addr()?.ip();
     loop {
-        let len = stream.read_u16().await? as usize;
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+        let read = async {
+            let len = stream.read_u16().await? as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            std::io::Result::Ok(buf)
+        };
+        let Ok(buf) = tokio::time::timeout(TCP_IDLE, read).await else {
+            return Ok(()); // idle
+        };
+        let buf = buf?;
         let Some(resp) = handle(&srv, &buf, Transport::Tcp, peer) else {
             return Ok(());
         };
@@ -243,11 +259,24 @@ async fn serve(srv: Arc<Server>, addr: &str) -> std::io::Result<()> {
     for _ in 0..workers {
         tokio::spawn(serve_udp(srv.clone(), udp.clone()));
     }
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNS));
     loop {
-        let (stream, _) = tcp.accept().await?;
+        // Accept errors (e.g. out of file descriptors) are transient: never exit the server.
+        let stream = match tcp.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("tcp accept: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue; // at capacity: drop the connection
+        };
         let srv = srv.clone();
         tokio::spawn(async move {
             let _ = serve_tcp_conn(srv, stream).await;
+            drop(slot);
         });
     }
 }
@@ -443,6 +472,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dns-garbage-{}", std::process::id()));
         let srv = Server::new(Store::open(&dir).unwrap());
         assert!(answer(&srv, b"garbage", Transport::Udp, LOCALHOST).is_none());
+
+        // ANY over UDP: truncated, no records (no amplification); TCP answers it in full.
+        load(&srv.store, Path::new("testdata/example.com.zone"), None).unwrap();
+        let mut m = Message::query();
+        m.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::ANY,
+        ));
+        let q = m.to_vec().unwrap();
+        let udp =
+            Message::from_vec(&answer(&srv, &q, Transport::Udp, LOCALHOST).unwrap().0).unwrap();
+        assert!(udp.metadata.truncation && udp.answers.is_empty());
+        let tcp =
+            Message::from_vec(&answer(&srv, &q, Transport::Tcp, LOCALHOST).unwrap().0).unwrap();
+        assert!(!tcp.metadata.truncation && !tcp.answers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

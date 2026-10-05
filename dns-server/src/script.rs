@@ -17,8 +17,9 @@
 //!
 //! Sandbox: one Lua state per worker thread (LuaJIT states aren't thread-safe), each script
 //! in its own environment over a read-only base of `math`, `string`, `table`, a few safe
-//! builtins and `in_cidr(ip, "10.0.0.0/8")`. No `io`, `os`, `require`, `debug`, `ffi` or
-//! `load`. Each call gets an instruction budget and the state has a memory limit.
+//! builtins and `in_cidr(ip, "10.0.0.0/8")`. No `io`, `os`, `require`, `debug`, `ffi`, `load`
+//! or `pcall` (which could catch the budget error). Source text only, never bytecode. Each call
+//! gets an instruction budget, the state has a memory limit, and `string.rep` output is capped.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ use std::rc::Rc;
 
 use hickory_proto::rr::rdata::NULL;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
+use mlua::chunk::ChunkMode;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
 /// `LUA` records are stored under a private-use type code (RFC 6895 §3.1) and never served.
@@ -69,9 +71,11 @@ pub fn decode_lua(r: &Record) -> Option<(RecordType, &str)> {
 /// Per-call instruction budget. Interpreted LuaJIT runs very roughly 100-500M instructions/s,
 /// so this is well under a millisecond for any script that stays within it.
 const INSTRUCTION_BUDGET: u64 = 200_000;
-const HOOK_EVERY: u32 = 1_000;
+const HOOK_EVERY: u32 = 100;
 const MEMORY_LIMIT: usize = 64 << 20; // per worker thread
-                                      // ponytail: unbounded per-thread compile cache; scripts are few. Evict if that changes.
+/// Largest string `string.rep` may build. It runs in C, where the instruction budget can't stop it.
+const MAX_REP_BYTES: usize = 64 * 1024;
+// ponytail: unbounded per-thread compile cache; scripts are few. Evict if that changes.
 
 pub struct Input<'a> {
     pub qname: &'a str,
@@ -128,9 +132,32 @@ impl Engine {
         // stopped. Interpreted LuaJIT is still fast; the budget only works without the JIT.
         // ponytail: JIT off for safety. Revisit with a watchdog if scripts become CPU-heavy.
         lua.load("jit.off()").exec()?;
-        let _ = lua.set_memory_limit(MEMORY_LIMIT); // unsupported on some LuaJIT builds
+        // A hard limit needs mlua's allocator, which LuaJIT refuses where heap addresses exceed
+        // 47 bits (e.g. aarch64 Linux). Then the hook checks the GC's count instead.
+        // ponytail: the soft check runs every HOOK_EVERY instructions, so one C call (e.g.
+        // repeated `..`) can briefly overshoot, up to LuaJIT's 2 GiB string cap. A separate
+        // script process with an rlimit is the upgrade if that matters.
+        let hard_limit = lua.set_memory_limit(MEMORY_LIMIT).is_ok();
 
         let globals = lua.globals();
+        // Replaced in the real string table, so `("x"):rep(n)` method calls are capped too.
+        let string: Table = globals.get("string")?;
+        let rep: Function = string.get("rep")?;
+        string.set(
+            "rep",
+            lua.create_function(
+                move |_, (s, n, sep): (mlua::LuaString, i64, Option<mlua::LuaString>)| {
+                    let sep_len = sep.as_ref().map_or(0, |s| s.as_bytes().len());
+                    let size = (s.as_bytes().len() + sep_len).saturating_mul(n.max(0) as usize);
+                    if size > MAX_REP_BYTES {
+                        return Err(mlua::Error::runtime(format!(
+                            "string.rep result over {MAX_REP_BYTES} bytes"
+                        )));
+                    }
+                    rep.call::<mlua::LuaString>((s, n, sep))
+                },
+            )?,
+        )?;
         let deny_write = lua.create_function(|_, ()| -> mlua::Result<()> {
             Err(mlua::Error::runtime(
                 "the script base environment is read-only",
@@ -152,8 +179,8 @@ impl Engine {
             base.set(name, read_only(globals.get::<Table>(name)?)?)?;
         }
         for name in [
-            "pairs", "ipairs", "next", "select", "type", "tostring", "tonumber", "error", "pcall",
-            "unpack", "assert",
+            "pairs", "ipairs", "next", "select", "type", "tostring", "tonumber", "error", "unpack",
+            "assert",
         ] {
             base.set(name, globals.get::<Value>(name)?)?;
         }
@@ -167,7 +194,10 @@ impl Engine {
         let counter = instructions.clone();
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(HOOK_EVERY),
-            move |_, _| {
+            move |lua, _| {
+                if !hard_limit && lua.used_memory() > MEMORY_LIMIT {
+                    return Err(mlua::Error::runtime("memory limit exceeded"));
+                }
                 counter.set(counter.get() + u64::from(HOOK_EVERY));
                 if counter.get() > INSTRUCTION_BUDGET {
                     return Err(mlua::Error::runtime("instruction budget exceeded"));
@@ -193,6 +223,7 @@ impl Engine {
             let f = self
                 .lua
                 .load(source)
+                .set_mode(ChunkMode::Text) // LuaJIT doesn't verify bytecode
                 .set_environment(env.clone())
                 .into_function()?;
             self.scripts.insert(source.to_string(), (f, env));
@@ -209,6 +240,10 @@ impl Engine {
         q.set("static", input.statics.clone())?;
         env.set("q", q)?;
 
+        // Garbage from earlier calls counts toward the soft limit; clear it before it matters.
+        if self.lua.used_memory() > MEMORY_LIMIT / 2 {
+            self.lua.gc_collect()?;
+        }
         self.instructions.set(0);
         Ok(match f.call::<Value>(())? {
             Value::Nil => Outcome::Empty,
@@ -302,6 +337,12 @@ mod tests {
             "return load('return 1')()",
             "return debug.getinfo(1)",
             "return jit.on()",
+            "return pcall(error)",
+            "local function f() while true do end end while true do pcall(f) end",
+            "\x1bLJ\x02\x00",
+            "return string.rep('x', 1e9)",
+            "return ('x'):rep(1e9)",
+            "local t, s = {}, ('x'):rep(65536) for i = 1, 2000 do t[i] = s .. i end",
         ] {
             assert!(
                 matches!(run(escape, &i), Outcome::Error(_)),
@@ -318,8 +359,8 @@ mod tests {
             Outcome::Answer(vec!["x".into()])
         ); // shadows only its own global
         assert_eq!(
-            run("return string.rep('a', 2)", &i),
-            Outcome::Answer(vec!["aa".into()])
+            run("return string.rep('a', 2) .. ('b'):rep(2, ',')", &i),
+            Outcome::Answer(vec!["aab,b".into()])
         );
         assert_eq!(
             run("return tostring(in_cidr ~= nil)", &i),

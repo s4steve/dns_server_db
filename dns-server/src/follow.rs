@@ -66,7 +66,15 @@ fn token() -> Option<&'static str> {
 /// GETs JSON from the control plane with the node's token, turning auth failures into
 /// messages that say what to fix.
 fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
-    let mut req = ureq::get(url);
+    // A stalled control plane must not hang the follower forever (zones would silently expire).
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let agent = AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .into()
+    });
+    let mut req = agent.get(url);
     if let Some(t) = token() {
         req = req.header("Authorization", &format!("Bearer {t}"));
     }
