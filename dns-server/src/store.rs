@@ -25,8 +25,9 @@ use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, B
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-// ponytail: fixed 1 GiB map (sparse, virtual). Make it configurable when a dataset nears it.
-const MAP_SIZE: usize = 1 << 30;
+/// Default LMDB map size (sparse, virtual). If the data outgrows it, writes fail and the node
+/// stops following, so raise it with `--map-size-mb` well before then.
+pub const MAP_SIZE: usize = 1 << 30;
 
 /// Changelog seq of the last entry applied to this node.
 pub const APPLIED_SEQ: &[u8] = b"applied_seq";
@@ -51,11 +52,15 @@ pub fn now() -> u64 {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_sized(path, MAP_SIZE)
+    }
+
+    pub fn open_sized(path: &Path, map_size: usize) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         // SAFETY: the env is opened once per process and the files are only touched through LMDB.
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(MAP_SIZE)
+                .map_size(map_size)
                 .max_dbs(3)
                 .open(path)?
         };

@@ -427,6 +427,20 @@ async fn permissions() {
         StatusCode::FORBIDDEN
     );
 
+    // Changesets are capped in size.
+    let too_many: Vec<Value> = (0..1001)
+        .map(|i| add(&format!("n{i}"), "A", "192.0.2.1"))
+        .collect();
+    let (status, body) = call(
+        &admin,
+        "POST",
+        &changes,
+        Some(json!({ "changes": too_many })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(errors(&body).contains("at most"), "{body}");
+
     // Editor: records yes; LUA scripts and zone settings no.
     let (status, body) = call(&editor, "POST", &changes, Some(a_record)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -473,6 +487,21 @@ async fn permissions() {
     let (_, me) = call(&scripter, "GET", "/whoami", None).await;
     assert_eq!(entry["actor"], me["name"]);
     assert_eq!(me["grants"][0]["scripts"], true);
+
+    // Owner of *.team.test can't capture names that already live in team.test (the editor
+    // added www there), because it isn't an editor of team.test. The admin can.
+    let www = json!({ "name": format!("www.{team}.test"), "ns": ["ns1.example.net."] });
+    let (status, body) = call(&owner, "POST", "/zones", Some(www.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(errors(&body).contains("parent"), "{body}");
+    let (status, body) = call(&admin, "POST", "/zones", Some(www)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        call(&admin, "DELETE", &format!("/zones/www.{team}.test"), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
 
     // Owner of *.team.test: creates zones below it, not the apex itself or elsewhere.
     let sub = format!("a.{team}.test");

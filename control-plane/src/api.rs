@@ -3,9 +3,11 @@
 //! authenticated and authorized per zone (see `auth.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,6 +22,12 @@ use crate::{spf, validate};
 // ponytail: one global lock serializes changelog inserts so seq order == commit order.
 // Ceiling: total write throughput; switch to a per-zone outbox if that ever matters.
 const CHANGELOG_LOCK: i64 = 0x646e_735f_6c6f_67; // "dns_log"
+/// Changes per changeset: big enough for any real edit, small enough to bound one transaction.
+const MAX_CHANGES: usize = 1000;
+// ponytail: global limits only. Per-client rate limiting and TLS belong in the reverse proxy
+// in front of this; slow request headers are also the proxy's job.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_REQUESTS: usize = 64;
 
 pub fn router(pool: PgPool) -> Router {
     Router::new()
@@ -37,7 +45,28 @@ pub fn router(pool: PgPool) -> Router {
         .route("/whoami", get(whoami))
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{name}", axum::routing::delete(revoke_token))
+        .layer(middleware::from_fn(limits))
         .with_state(pool)
+}
+
+/// Sheds load past MAX_CONCURRENT_REQUESTS and cuts off requests (body reads included) that
+/// run longer than REQUEST_TIMEOUT. A cut-off request's transaction is rolled back.
+async fn limits(req: Request, next: Next) -> Response {
+    static SLOTS: tokio::sync::Semaphore =
+        tokio::sync::Semaphore::const_new(MAX_CONCURRENT_REQUESTS);
+    let unavailable = |e: &str| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "errors": [e] })),
+        )
+            .into_response()
+    };
+    let Ok(_slot) = SLOTS.try_acquire() else {
+        return unavailable("too many concurrent requests; retry shortly");
+    };
+    tokio::time::timeout(REQUEST_TIMEOUT, next.run(req))
+        .await
+        .unwrap_or_else(|_| unavailable("request timed out"))
 }
 
 // ---------- errors ----------
@@ -386,6 +415,24 @@ async fn create_zone(
     let rname = rname.unwrap_or_else(|| format!("hostmaster.{zone}"));
 
     let mut tx = pool.begin().await?;
+    // A new zone takes over every name at and below its apex. If a parent zone already has
+    // records there, the caller must be able to edit that parent: owning `*.example.com` must
+    // not let a token capture names that live in someone else's `example.com`.
+    let parents: Vec<String> = sqlx::query_scalar(
+        "SELECT z.name FROM zones z WHERE right($1, length(z.name) + 1) = '.' || z.name
+         AND EXISTS (SELECT 1 FROM records r WHERE r.zone_id = z.id
+                     AND (r.name = $1 OR right(r.name, length($1) + 1) = '.' || $1))",
+    )
+    .bind(zone.to_string())
+    .fetch_all(&mut *tx)
+    .await?;
+    for parent in parents.iter().filter_map(|p| validate::parse_zone(p).ok()) {
+        if caller.role(&parent) < Some(Role::Editor) {
+            return Err(ApiError::Forbidden(format!(
+                "zone {zone} would take over existing records of a parent zone; that needs editor on the parent"
+            )));
+        }
+    }
     let id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO zones (name, default_ttl, mname, rname, serial, refresh, retry, expire, minimum)
          VALUES ($1, $2, $3, $4, 0,
@@ -578,6 +625,11 @@ async fn apply_changes(
     caller.require(&zone, Role::Editor)?;
     if req.changes.is_empty() {
         return Err(bad("changes: at least one change is required"));
+    }
+    if req.changes.len() > MAX_CHANGES {
+        return Err(bad(format!(
+            "changes: at most {MAX_CHANGES} per changeset; split it up"
+        )));
     }
     let mut errors = vec![];
     let parsed: Vec<Parsed> = req

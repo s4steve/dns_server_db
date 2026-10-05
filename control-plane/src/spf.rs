@@ -53,6 +53,9 @@ impl Resolve for TokioResolver {
     }
 }
 
+/// Whole-flatten deadline, so a slow sender's DNS can't hold a request or the refresh loop.
+const FLATTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Flattens `senders` using the system resolver.
 pub async fn flatten_live(senders: &[String]) -> Result<Vec<String>, String> {
     static RESOLVER: OnceLock<Result<TokioResolver, String>> = OnceLock::new();
@@ -63,7 +66,14 @@ pub async fn flatten_live(senders: &[String]) -> Result<Vec<String>, String> {
                 .map_err(|e| format!("no DNS resolver available: {e}"))
         })
         .as_ref()?;
-    flatten(resolver, senders).await
+    tokio::time::timeout(FLATTEN_TIMEOUT, flatten(resolver, senders))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "resolving senders took longer than {}s",
+                FLATTEN_TIMEOUT.as_secs()
+            ))
+        })
 }
 
 /// Resolves each sender into `ip4:`/`ip6:` terms: sorted, without duplicates.

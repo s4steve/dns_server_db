@@ -37,7 +37,7 @@ A `LUA` record's data is `<TYPE> <script>`. The script answers queries of that t
 ```bash
 curl -X POST localhost:8053/zones/example.com/changes -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d @- <<'EOF'
 {"changes":[{"action":"add","name":"www","type":"LUA","ttl":60,
-  "data":"A if in_cidr(q.client, '10.0.0.0/8') then return '192.0.2.10' end return {'192.0.2.20', '192.0.2.21'}"}]}
+  "data":"A if in_cidr(q.client, '198.51.100.0/24') then return '192.0.2.10' end return {'192.0.2.20', '192.0.2.21'}"}]}
 EOF
 ```
 
@@ -54,6 +54,8 @@ EOF
 | `q.static` | The static records being overridden, as text |
 
 Helpers: `in_cidr(ip, "10.0.0.0/8")`, plus Lua's `math`, `string` and `table` libraries.
+
+**`q.client` is chosen by whoever sends the query.** Any client can put any address in an ECS option, so `q.client` is fine for tailoring answers (geography, load spreading) but never for deciding who may see something. Don't return internal addresses based on it. `q.source` is the address the answer is sent to.
 
 **What a script returns:** record data in zone-file syntax, as one string or a list of strings. The records it builds get the `LUA` record's TTL.
 
@@ -72,8 +74,10 @@ Answers that don't come from a script carry ECS scope 0, so resolvers can cache 
 **Sandbox:**
 - There's one Lua state per worker thread, and each script has its own globals.
 - The shared libraries are read-only.
-- No `io`, `os`, `require`, `load`, `debug` or `ffi`.
-- Each call has a budget of 200k instructions, and each state has a 64 MiB memory limit.
+- No `io`, `os`, `require`, `load`, `debug`, `ffi` or `pcall`, and source text only (never precompiled bytecode).
+- Scripts are at most 16 KiB, and `string.rep` builds at most 64 KiB.
+- Each call has a budget of 200k instructions, and each state has a 64 MiB memory limit. Where LuaJIT won't use mlua's allocator (e.g. aarch64 Linux), the limit is checked every 100 instructions, so a script can briefly overshoot it.
+- Limits: the budget can't interrupt C functions such as string pattern matching, and scripts run on the node's worker threads. A script that hangs inside one blocks that thread on every node. Grant `scripts` only to tokens you'd trust with the nodes themselves.
 - LuaJIT's JIT compiler is off. The instruction budget can't interrupt JIT-compiled code, so a runaway loop could otherwise never be stopped.
 
 `LUA` records themselves are never served, not even to ANY queries.
@@ -138,17 +142,17 @@ cargo build --release -p mcp-server
 ```
 
 ```bash
-claude mcp add dns -e CONTROL_PLANE_URL=http://127.0.0.1:8053 -e CONTROL_PLANE_TOKEN=dnsdb_... -- "$PWD/target/release/mcp-server"
+claude mcp add dns -e CONTROL_PLANE_URL=http://127.0.0.1:8053 -e CONTROL_PLANE_TOKEN="$DNS_TOKEN" -- "$PWD/target/release/mcp-server"
 ```
 
-Or, in a project's `.mcp.json`:
+Or, in a project's `.mcp.json`. Reference the token from your environment rather than pasting it in, because `.mcp.json` is usually committed:
 
 ```json
 {
   "mcpServers": {
     "dns": {
       "command": "/absolute/path/to/target/release/mcp-server",
-      "env": { "CONTROL_PLANE_URL": "http://127.0.0.1:8053", "CONTROL_PLANE_TOKEN": "dnsdb_..." }
+      "env": { "CONTROL_PLANE_URL": "http://127.0.0.1:8053", "CONTROL_PLANE_TOKEN": "${DNS_TOKEN}" }
     }
   }
 }
@@ -157,6 +161,10 @@ Or, in a project's `.mcp.json`:
 `CONTROL_PLANE_URL` defaults to `http://127.0.0.1:8053`.
 
 The MCP server can do exactly what its token allows (see [Access control](#access-control)), and the `whoami` tool shows the model what that is. Give it a token scoped to the zones it should manage, and leave out `scripts` unless it should write `LUA` records.
+
+Record data reaches the model as tool output, and other token holders can write it (a TXT record, say). Treat it like any untrusted text the model reads:
+- For read-only use, give the MCP server a `viewer` token.
+- Keep your client's approval prompt on for the tools marked destructive (`delete_zone`, `apply_changes` and the SPF writes).
 
 ## Access control
 
@@ -174,7 +182,7 @@ A token has a **name**, which is recorded as the `actor` on every change it make
 |---|---|
 | `viewer` | Read the zone, and see it in `/zones` and `/changelog` |
 | `editor` | Everything a viewer can, plus apply record changes |
-| `owner` | Everything an editor can, plus change zone settings and delete the zone. Can also create zones matching the pattern (so `*.team.example.com` lets a team create its own zones). |
+| `owner` | Everything an editor can, plus change zone settings and delete the zone. Can also create zones matching the pattern (so `*.team.example.com` lets a team create its own zones). Creating a zone that would take over records a parent zone already has at or below its apex also needs editor on that parent. |
 | `scripts` (flag) | Add or delete `LUA` records, which run code on every DNS node. Needs editor or owner. |
 | `admin` (token flag) | Owner with scripts on every zone, plus token management |
 
@@ -225,6 +233,7 @@ Node flags for running in production:
 | `--rrl-rps N` | off | Response rate limit: identical responses per second per client network |
 | `--rrl-slip N` | 2 | Send every Nth rate-limited response truncated instead of dropping it (0 = drop all) |
 | `--cookie-secret HEX` | random | 32 hex digits. Give every node behind one anycast address the same secret. |
+| `--map-size-mb N` | 1024 | LMDB map size. If the data outgrows it, writes fail and the node stops following, so watch `dns_follow_errors_total`. |
 
 **Health:** `GET /health` returns 200 while the node serves at least one zone that hasn't expired, and 503 otherwise. The JSON body includes zone counts, `applied_seq` and the time since the last sync.
 
@@ -250,6 +259,9 @@ process dns-health {
 - Negative answers count against the zone rather than the name, so a flood of random subdomains shares one bucket.
 - Over the limit, responses are dropped, except every `--rrl-slip`th one, which is sent truncated so a real client can retry over TCP.
 - TCP queries and clients presenting a valid server cookie are never limited.
+- ANY queries over UDP always get a truncated answer (RFC 8482), so they can't be used for amplification. Over TCP they're answered in full.
+
+**TCP:** a connection that sends no complete query for 10 seconds is closed, and a node holds at most 1024 TCP connections.
 
 **DNS cookies** follow RFC 7873, with RFC 9018 server cookies (SipHash-2-4 with a timestamp, valid for an hour). Cookies are optional: a missing or invalid server cookie gets a fresh cookie and a normal answer. A malformed cookie option gets FORMERR.
 
@@ -316,6 +328,14 @@ cargo test
 
 Listens on `127.0.0.1:8053`. Override with the `LISTEN` and `DATABASE_URL` environment variables. Every request needs a token; mint the first one with `create-token` (see [Access control](#access-control)).
 
+The API serves plain HTTP. Anywhere beyond localhost, put it behind a reverse proxy that terminates TLS and rate-limits clients, and point nodes and the MCP server at `https://`. Tokens, and the changelog with its `LUA` scripts, would otherwise cross the network in the clear.
+
+**Limits:**
+- 64 requests at once; beyond that, requests get 503.
+- 30 seconds per request.
+- 1000 changes per changeset.
+- 20 seconds to resolve an SPF policy's senders.
+
 ```bash
 cargo run -p control-plane
 ```
@@ -356,7 +376,8 @@ Validation covers:
 - the apex keeping at least one NS;
 - a single TTL per RRset;
 - names that belong to a hosted child zone (those must be changed in that zone);
-- for `LUA` records: an allowed answer type, a script that compiles, and one script per type.
+- for `LUA` records: an allowed answer type, a script that compiles from source text, at most 16 KiB, and one script per type;
+- that the data fits what nodes can store: TXT strings of at most 255 bytes, and at most 60,000 bytes of records at one name.
 
 Each changelog entry carries the complete new record set of every name it touches, so replaying an entry is safe.
 

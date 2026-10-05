@@ -19,8 +19,9 @@ const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", 
 const LUA_HELP: &str = "LUA records: type \"LUA\", data \"<TYPE> <script>\" where TYPE is A, AAAA, TXT, MX or CAA. \
 The script runs per query and returns record data as a string or list of strings (nil = serve the static records). \
 It reads q.name, q.type, q.client (EDNS client subnet address, else source IP), q.client_prefix, q.source, q.node \
-and q.static, and can call in_cidr(ip, \"10.0.0.0/8\"). Example data: \
-\"A if in_cidr(q.client, '10.0.0.0/8') then return '192.0.2.10' end return '192.0.2.20'\".";
+and q.static, and can call in_cidr(ip, \"10.0.0.0/8\"). q.client comes from the query's EDNS client subnet, which any \
+client can set: use it to tailor answers, never to decide who may see internal addresses. Example data: \
+\"A if in_cidr(q.client, '198.51.100.0/24') then return '192.0.2.10' end return '192.0.2.20'\".";
 
 fn tools() -> Value {
     let zone = json!({ "type": "string", "description": "Zone name, e.g. \"example.com\"" });

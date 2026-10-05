@@ -307,7 +307,8 @@ const USAGE: &str = "usage:
   --rrl-rps N           response rate limit per client block and response (default: off)
   --rrl-slip N          send every Nth limited response truncated instead of dropping it
                         (default 2; 0 = drop all)
-  --cookie-secret HEX   32 hex digits; share it across anycast nodes (default: random)";
+  --cookie-secret HEX   32 hex digits; share it across anycast nodes (default: random)
+  --map-size-mb N       LMDB map size; writes fail once the data outgrows it (default 1024)";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -328,6 +329,7 @@ async fn main() -> store::Result<()> {
             let (mut listen, mut follow, mut poll_ms, mut http) =
                 ("127.0.0.1:5300", None, 1000, None);
             let (mut rrl_rps, mut rrl_slip, mut secret) = (0u32, 2u32, None);
+            let mut map_size = store::MAP_SIZE;
             let num = |v: &str| -> u64 { v.parse().unwrap_or_else(|_| usage()) };
             for pair in flags.chunks(2) {
                 match pair {
@@ -340,6 +342,7 @@ async fn main() -> store::Result<()> {
                     ["--http", v] => http = Some(v.to_string()),
                     ["--rrl-rps", v] => rrl_rps = num(v) as u32,
                     ["--rrl-slip", v] => rrl_slip = num(v) as u32,
+                    ["--map-size-mb", v] => map_size = num(v) as usize * (1 << 20),
                     ["--cookie-secret", v] => {
                         secret = Some(cookie::parse_secret(v).unwrap_or_else(|| usage()))
                     }
@@ -347,7 +350,7 @@ async fn main() -> store::Result<()> {
                 }
             }
             let _ = NODE_ID.set(std::env::var("HOSTNAME").unwrap_or_default());
-            let mut store = Store::open(&PathBuf::from(db))?;
+            let mut store = Store::open_sized(&PathBuf::from(db), map_size)?;
             store.enforce_expiry = follow.is_some();
             let srv = Arc::new(Server {
                 store: Arc::new(store),
