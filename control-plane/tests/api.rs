@@ -577,3 +577,157 @@ async fn permissions() {
         );
     }
 }
+
+/// TXT records in `zone` as (owner, data), sorted; plus the zone's serial.
+async fn txt_records(app: &Api, zone: &str) -> (Vec<(String, String)>, i64) {
+    let (status, body) = call(app, "GET", &format!("/zones/{zone}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut txt: Vec<(String, String)> = body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["type"] == "TXT")
+        .map(|r| {
+            let owner = r["name"].as_str().unwrap();
+            let short = owner.strip_suffix(&format!(".{zone}.")).unwrap_or(owner);
+            (short.to_string(), r["data"].as_str().unwrap().to_string())
+        })
+        .collect();
+    txt.sort();
+    (txt, body["serial"].as_i64().unwrap())
+}
+
+#[tokio::test]
+async fn managed_spf() {
+    // Literal senders only, so the test needs no outside DNS. (Flattening domains is
+    // covered by the unit tests in spf.rs.)
+    let admin = app().await;
+    let zone = format!("{}.test", unique("spf"));
+    let (status, body) = call(
+        &admin,
+        "POST",
+        "/zones",
+        Some(json!({ "name": zone, "ns": ["ns1.example.net."] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let editor_name = unique("spf-editor-");
+    let editor = admin
+        .with_new_token(&editor_name, false, &[(&zone, "editor")])
+        .await;
+    let viewer = admin
+        .with_new_token(&unique("spf-viewer-"), false, &[(&zone, "viewer")])
+        .await;
+    let (status, body) = call(
+        &editor,
+        "POST",
+        &format!("/zones/{zone}/changes"),
+        Some(json!({ "changes": [
+            add("mail", "TXT", "\"site-verification=abc\""),
+            add("mail", "TXT", "\"v=spf1 -all\""),
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = format!("/zones/{zone}/spf/mail");
+    let start = log_after(&admin, &format!("{zone}."), 0).await;
+    let start_seq = start.last().unwrap()["seq"].as_i64().unwrap();
+
+    // 60 networks need three chunks. The hand-written v=spf1 record is replaced; the other
+    // TXT record at the name is kept.
+    let many: Vec<String> = (0..60).map(|i| format!("192.0.{i}.0/24")).collect();
+    let (status, body) = call(&editor, "PUT", &policy, Some(json!({ "senders": many }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["terms"].as_array().unwrap().len(), 60);
+    let (txt, _) = txt_records(&admin, &zone).await;
+    let owners: Vec<&str> = txt.iter().map(|(o, _)| o.as_str()).collect();
+    assert_eq!(
+        owners,
+        ["_spf0.mail", "_spf1.mail", "_spf2.mail", "mail", "mail"]
+    );
+    assert!(txt.contains(&("mail".into(), "\"site-verification=abc\"".into())));
+    assert!(txt.contains(&(
+        "mail".into(),
+        format!("\"v=spf1 include:_spf0.mail.{zone} include:_spf1.mail.{zone} include:_spf2.mail.{zone} ~all\"")
+    )));
+    assert!(
+        txt[0]
+            .1
+            .starts_with("\"v=spf1 ip4:192.0.0.0/24 ip4:192.0.1.0/24 ")
+    );
+
+    // Fewer senders: the extra chunks are deleted. The same policy again changes nothing.
+    let few = json!({ "senders": ["ip4:198.51.100.7", "2001:db8::/48"], "qualifier": "-all" });
+    let (status, body) = call(&editor, "PUT", &policy, Some(few.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (txt, serial) = txt_records(&admin, &zone).await;
+    assert_eq!(
+        txt,
+        [
+            (
+                "_spf0.mail".into(),
+                "\"v=spf1 ip4:198.51.100.7 ip6:2001:db8::/48\"".into()
+            ),
+            ("mail".into(), "\"site-verification=abc\"".into()),
+            (
+                "mail".into(),
+                format!("\"v=spf1 include:_spf0.mail.{zone} -all\"")
+            ),
+        ]
+    );
+    let (status, body) = call(&editor, "PUT", &policy, Some(few)).await;
+    assert_eq!(
+        (status, &body["change"]),
+        (StatusCode::OK, &Value::Null),
+        "{body}"
+    );
+    assert_eq!(txt_records(&admin, &zone).await.1, serial);
+    let entries = log_after(&admin, &format!("{zone}."), start_seq).await;
+    assert!(entries.iter().all(|e| e["actor"] == editor_name.as_str()));
+
+    // Bad input is rejected and stores nothing; viewers can read but not write.
+    for bad in [
+        json!({ "senders": [] }),
+        json!({ "senders": ["ip4:10.0.0.0/40"] }),
+        json!({ "senders": ["1.2.3.4"], "qualifier": "+all" }),
+    ] {
+        let (status, body) = call(&editor, "PUT", &policy, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let (status, body) = call(&viewer, "GET", &policy, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["terms"],
+        json!(["ip4:198.51.100.7", "ip6:2001:db8::/48"])
+    );
+    let (status, _) = call(&viewer, "DELETE", &policy, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A refresh repairs a hand-deleted chunk, as actor spf-refresh.
+    let (status, body) = call(
+        &editor,
+        "POST",
+        &format!("/zones/{zone}/changes"),
+        Some(json!({ "changes": [{ "action": "delete", "name": "_spf0.mail", "type": "TXT" }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    control_plane::api::refresh_spf(&admin.pool).await.unwrap();
+    let (repaired, _) = txt_records(&admin, &zone).await;
+    assert_eq!(repaired, txt);
+    let last = log_after(&admin, &format!("{zone}."), start_seq).await;
+    assert_eq!(last.last().unwrap()["actor"], "spf-refresh");
+
+    // Deleting the policy removes only its records.
+    let (status, body) = call(&editor, "DELETE", &policy, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (txt, _) = txt_records(&admin, &zone).await;
+    assert_eq!(
+        txt,
+        [("mail".to_string(), "\"site-verification=abc\"".to_string())]
+    );
+    assert_eq!(
+        call(&editor, "GET", &policy, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sqlx::{FromRow, PgConnection, PgPool};
 
 use crate::auth::{self, Caller, Grant, Role};
-use crate::validate;
+use crate::{spf, validate};
 
 // ponytail: one global lock serializes changelog inserts so seq order == commit order.
 // Ceiling: total write throughput; switch to a per-zone outbox if that ever matters.
@@ -29,6 +29,10 @@ pub fn router(pool: PgPool) -> Router {
             get(get_zone).patch(patch_zone).delete(delete_zone),
         )
         .route("/zones/{zone}/changes", post(apply_changes))
+        .route(
+            "/zones/{zone}/spf/{name}",
+            get(get_spf).put(put_spf).delete(delete_spf),
+        )
         .route("/changelog", get(changelog))
         .route("/whoami", get(whoami))
         .route("/tokens", get(list_tokens).post(create_token))
@@ -600,7 +604,21 @@ async fn apply_changes(
     }
 
     let mut tx = pool.begin().await?;
-    let row = lock_zone(&mut tx, &zone).await?;
+    let result = apply_parsed(&mut tx, &zone, &parsed, &caller.name).await?;
+    tx.commit().await?;
+    Ok(Json(result))
+}
+
+/// Applies parsed changes inside the caller's transaction, validates every touched name, and
+/// commits them as one changelog entry. Any error leaves the transaction to be rolled back.
+async fn apply_parsed(
+    tx: &mut PgConnection,
+    zone: &Name,
+    parsed: &[Parsed],
+    actor: &str,
+) -> ApiResult<Value> {
+    let mut errors = vec![];
+    let row = lock_zone(tx, zone).await?;
     let mut touched = BTreeSet::new();
 
     for (i, change) in parsed.iter().enumerate() {
@@ -691,15 +709,242 @@ async fn apply_changes(
                 Some((validate::parse_type(t).ok()?, *ttl as u32, data.as_str()))
             })
             .collect();
-        errors.extend(validate::check_name(&zone, &owner, &records));
+        errors.extend(validate::check_name(zone, &owner, &records));
     }
 
     if !errors.is_empty() {
-        return Err(ApiError::BadRequest(errors)); // tx drops -> rollback
+        return Err(ApiError::BadRequest(errors)); // the caller's tx rolls back
     }
-    let result = commit_change(&mut tx, &row, touched, &caller.name).await?;
+    commit_change(tx, &row, touched, actor).await
+}
+
+// ---------- managed SPF ----------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpfPolicy {
+    senders: Vec<String>,
+    qualifier: Option<String>,
+}
+
+/// Makes the managed TXT records for `name` (its `v=spf1` record and the `_spfN` chunks)
+/// match `desired`, as one change. Other TXT records at `name` are left alone. Returns
+/// `None` when nothing differs, so refreshes don't bump the serial.
+async fn sync_spf_records(
+    tx: &mut PgConnection,
+    zone: &Name,
+    name: &Name,
+    desired: &[(String, String)],
+    actor: &str,
+) -> ApiResult<Option<Value>> {
+    let row = lock_zone(tx, zone).await?;
+    let existing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, data FROM records WHERE zone_id = $1 AND type = 'TXT'
+         AND ((name = $2 AND lower(data) LIKE '\"v=spf1%') OR name = ANY($3))",
+    )
+    .bind(row.id)
+    .bind(name.to_string())
+    .bind(spf::chunk_names(name))
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut want = vec![];
+    for (owner, text) in desired {
+        let data = validate::parse_data(RecordType::TXT, &spf::txt_data(text)).map_err(bad)?;
+        want.push((owner.clone(), data));
+    }
+    let to_name = |owner: &str| validate::parse_name(owner, zone).map_err(bad);
+    let mut parsed = vec![];
+    for (owner, data) in existing.iter().filter(|r| !want.contains(r)) {
+        parsed.push(Parsed::Delete {
+            name: to_name(owner)?,
+            rtype: RecordType::TXT,
+            data: Some(data.clone()),
+        });
+    }
+    for (owner, data) in want.iter().filter(|r| !existing.contains(r)) {
+        parsed.push(Parsed::Add {
+            name: to_name(owner)?,
+            rtype: RecordType::TXT,
+            ttl: None,
+            data: data.clone(),
+        });
+    }
+    if parsed.is_empty() {
+        return Ok(None);
+    }
+    apply_parsed(tx, zone, &parsed, actor).await.map(Some)
+}
+
+fn spf_path(caller: &Caller, zone: &str, name: &str, role: Role) -> ApiResult<(Name, Name)> {
+    let zone = validate::parse_zone(zone).map_err(bad)?;
+    caller.require(&zone, role)?;
+    let name = validate::parse_name(name, &zone).map_err(bad)?;
+    Ok((zone, name))
+}
+
+/// Flattens the senders now; on success stores the policy and publishes its records.
+async fn put_spf(
+    caller: Caller,
+    State(pool): State<PgPool>,
+    Path((zone, name)): Path<(String, String)>,
+    Json(req): Json<SpfPolicy>,
+) -> ApiResult<Json<Value>> {
+    let (zone, name) = spf_path(&caller, &zone, &name, Role::Editor)?;
+    let qualifier = req.qualifier.unwrap_or_else(|| "~all".into());
+    if !spf::QUALIFIERS.contains(&qualifier.as_str()) {
+        return Err(bad(format!(
+            "qualifier must be one of {:?}",
+            spf::QUALIFIERS
+        )));
+    }
+    if req.senders.is_empty() {
+        return Err(bad("senders: at least one sender is required"));
+    }
+    let terms = spf::flatten_live(&req.senders).await.map_err(bad)?;
+    let desired = spf::render(&name, &terms, &qualifier).map_err(bad)?;
+
+    let mut tx = pool.begin().await?;
+    let change = sync_spf_records(&mut tx, &zone, &name, &desired, &caller.name).await?;
+    sqlx::query(
+        "INSERT INTO spf_policies (zone_id, name, senders, qualifier, terms)
+         SELECT id, $2, $3, $4, $5 FROM zones WHERE name = $1
+         ON CONFLICT (zone_id, name) DO UPDATE SET senders = EXCLUDED.senders,
+           qualifier = EXCLUDED.qualifier, terms = EXCLUDED.terms, last_error = NULL,
+           updated_at = now()",
+    )
+    .bind(zone.to_string())
+    .bind(name.to_string())
+    .bind(&req.senders)
+    .bind(&qualifier)
+    .bind(&terms)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(Json(result))
+    Ok(Json(json!({
+        "name": name.to_string(), "terms": terms, "records": desired.len(), "change": change,
+    })))
+}
+
+async fn get_spf(
+    caller: Caller,
+    State(pool): State<PgPool>,
+    Path((zone, name)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let (zone, name) = spf_path(&caller, &zone, &name, Role::Viewer)?;
+    let (senders, qualifier, terms, last_error, updated_at): (
+        Vec<String>,
+        String,
+        Vec<String>,
+        Option<String>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT p.senders, p.qualifier, p.terms, p.last_error, p.updated_at::text
+         FROM spf_policies p JOIN zones z ON z.id = p.zone_id WHERE z.name = $1 AND p.name = $2",
+    )
+    .bind(zone.to_string())
+    .bind(name.to_string())
+    .fetch_optional(&pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("no SPF policy at {name}")))?;
+    Ok(Json(json!({
+        "name": name.to_string(), "senders": senders, "qualifier": qualifier, "terms": terms,
+        "last_error": last_error, "updated_at": updated_at,
+    })))
+}
+
+/// Removes the policy and the records it published.
+async fn delete_spf(
+    caller: Caller,
+    State(pool): State<PgPool>,
+    Path((zone, name)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let (zone, name) = spf_path(&caller, &zone, &name, Role::Editor)?;
+    let mut tx = pool.begin().await?;
+    let deleted = sqlx::query(
+        "DELETE FROM spf_policies p USING zones z
+         WHERE z.id = p.zone_id AND z.name = $1 AND p.name = $2",
+    )
+    .bind(zone.to_string())
+    .bind(name.to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if deleted == 0 {
+        return Err(ApiError::NotFound(format!("no SPF policy at {name}")));
+    }
+    let change = sync_spf_records(&mut tx, &zone, &name, &[], &caller.name).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "name": name.to_string(), "change": change })))
+}
+
+/// Re-flattens every policy and publishes whatever changed, as actor `spf-refresh`. A
+/// policy that fails to flatten keeps its last good records and gets `last_error`, so a
+/// sender's DNS outage never removes authorized addresses.
+pub async fn refresh_spf(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let policies: Vec<(String, String, Vec<String>, String)> = sqlx::query_as(
+        "SELECT z.name, p.name, p.senders, p.qualifier
+         FROM spf_policies p JOIN zones z ON z.id = p.zone_id ORDER BY z.name, p.name",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (zone, name, senders, qualifier) in policies {
+        let (Ok(zone), Ok(name)) = (validate::parse_zone(&zone), validate::parse_zone(&name))
+        else {
+            continue;
+        };
+        let result = match spf::flatten_live(&senders).await {
+            Ok(terms) => spf::render(&name, &terms, &qualifier).map(|d| (terms, d)),
+            Err(e) => Err(e),
+        };
+        let mut tx = pool.begin().await?;
+        // Skip a policy deleted or replaced while we were resolving.
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT p.zone_id FROM spf_policies p JOIN zones z ON z.id = p.zone_id
+             WHERE z.name = $1 AND p.name = $2 AND p.senders = $3 AND p.qualifier = $4
+             FOR UPDATE OF p",
+        )
+        .bind(zone.to_string())
+        .bind(name.to_string())
+        .bind(&senders)
+        .bind(&qualifier)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(zone_id) = current else { continue };
+        let error = match result {
+            Ok((terms, desired)) => {
+                match sync_spf_records(&mut tx, &zone, &name, &desired, "spf-refresh").await {
+                    Ok(_) => {
+                        sqlx::query(
+                            "UPDATE spf_policies SET terms = $3, last_error = NULL, updated_at = now()
+                             WHERE zone_id = $1 AND name = $2",
+                        )
+                        .bind(zone_id)
+                        .bind(name.to_string())
+                        .bind(&terms)
+                        .execute(&mut *tx)
+                        .await?;
+                        tx.commit().await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        tx.rollback().await?;
+                        tx = pool.begin().await?;
+                        format!("{e:?}")
+                    }
+                }
+            }
+            Err(e) => e,
+        };
+        eprintln!("spf refresh of {name}: {error}");
+        sqlx::query("UPDATE spf_policies SET last_error = $3 WHERE zone_id = $1 AND name = $2")
+            .bind(zone_id)
+            .bind(name.to_string())
+            .bind(&error)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 // ---------- changelog ----------
