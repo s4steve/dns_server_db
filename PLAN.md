@@ -115,6 +115,7 @@ Each stage ended with something runnable and a test that fails if it breaks.
 
 **After the stages: managed SPF. ✅**
 - `PUT/GET/DELETE /zones/{zone}/spf/{name}` and a background refresher in the control plane. Writes go through the normal change path, so validation, serial bumps, the changelog and the actor are reused, and the DNS nodes needed no changes.
+- The MCP server has `get_spf_policy`, `set_spf_policy` and `delete_spf_policy` tools, for eleven tools in total.
 - Senders using `exists:`, `ptr` or macros are rejected. Non-pass terms in included records are dropped.
 
 ## Verification

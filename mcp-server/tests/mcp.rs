@@ -151,6 +151,9 @@ fn mcp_round_trip() {
             "delete_zone",
             "apply_changes",
             "get_changelog",
+            "get_spf_policy",
+            "set_spf_policy",
+            "delete_spf_policy",
             "whoami"
         ]
     );
@@ -210,6 +213,39 @@ fn mcp_round_trip() {
             .any(|r| r["type"] == "LUA")
     );
 
+    // Managed SPF: literal senders only, so no outside DNS is needed.
+    let (err, text) = c.tool(
+        "set_spf_policy",
+        json!({ "zone": zone, "name": "@", "senders": ["192.0.2.0/24", "ip6:2001:db8::/32"], "qualifier": "-all" }),
+    );
+    assert!(!err, "{text}");
+    let (err, text) = c.tool("get_spf_policy", json!({ "zone": zone, "name": "@" }));
+    assert!(!err, "{text}");
+    let policy: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (policy["terms"].clone(), policy["qualifier"].clone()),
+        (
+            json!(["ip4:192.0.2.0/24", "ip6:2001:db8::/32"]),
+            json!("-all")
+        )
+    );
+    let (err, text) = c.tool(
+        "set_spf_policy",
+        json!({ "zone": zone, "name": "@", "senders": ["exists:%{i}.x.test"] }),
+    );
+    assert!(err && text.contains("rejected"), "{text}");
+    assert!(
+        c.tool("get_spf_policy", json!({ "zone": zone, "name": "a/b" }))
+            .0
+    );
+    let (err, text) = c.tool("delete_spf_policy", json!({ "zone": zone, "name": "@" }));
+    assert!(!err, "{text}");
+    assert!(
+        c.tool("get_spf_policy", json!({ "zone": zone, "name": "@" }))
+            .1
+            .contains("404")
+    );
+
     let (err, text) = c.tool("update_zone", json!({ "zone": zone, "expire": 7200 }));
     assert!(!err, "{text}");
     let (_, text) = c.tool("list_zones", json!({}));
@@ -222,7 +258,7 @@ fn mcp_round_trip() {
         .unwrap();
     assert_eq!(
         (mine["serial"].as_i64(), mine["soa"]["expire"].as_i64()),
-        (Some(3), Some(7200))
+        (Some(5), Some(7200))
     );
 
     let (err, text) = c.tool(
@@ -238,7 +274,7 @@ fn mcp_round_trip() {
         .filter(|e| e["zone"] == format!("{zone}."))
         .map(|e| e["serial"].as_i64().unwrap())
         .collect();
-    assert_eq!(serials, [2, 3]);
+    assert_eq!(serials, [2, 3, 4, 5]); // changes, SPF set, SPF delete, update_zone
 
     // Bad input and unknown names are errors, not crashes.
     assert!(c.tool("get_zone", json!({ "zone": "../zones" })).0);

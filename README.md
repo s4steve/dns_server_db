@@ -126,6 +126,9 @@ _spf1.N    TXT "v=spf1 …"
 | `delete_zone` | `DELETE /zones/{zone}` | Deletes a zone (marked destructive) |
 | `apply_changes` | `POST /zones/{zone}/changes` | Applies an atomic changeset; its description explains `LUA` records (marked destructive) |
 | `get_changelog` | `GET /changelog` | Reads changelog entries for zones the token can see, including who made each change (read-only) |
+| `get_spf_policy` | `GET /zones/{zone}/spf/{name}` | Shows a managed SPF policy, its flattened terms and any refresh error (read-only) |
+| `set_spf_policy` | `PUT /zones/{zone}/spf/{name}` | Creates or replaces a managed SPF policy; flattens its senders now (marked destructive) |
+| `delete_spf_policy` | `DELETE /zones/{zone}/spf/{name}` | Deletes a policy and its TXT records (marked destructive) |
 | `whoami` | `GET /whoami` | Shows the token's name and grants (read-only) |
 
 Build it and register it with Claude Code:
