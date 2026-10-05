@@ -109,6 +109,8 @@ pub struct Caller {
     pub name: String,
     pub admin: bool,
     pub grants: Vec<Grant>,
+    /// None: the token never expires (CLI-minted tokens, such as the nodes').
+    pub expires_at: Option<String>,
 }
 
 impl Caller {
@@ -163,6 +165,18 @@ impl Caller {
     }
 }
 
+/// Estimated strength of a supplied secret in bits: length × log2(distinct characters).
+/// Generated secrets are 256 random bits; this keeps supplied ones from being guessable.
+// ponytail: blind to dictionary words and keyboard patterns; generated secrets (e.g.
+// `openssl rand -hex 32`) remain the advice.
+fn strength_bits(secret: &str) -> f64 {
+    let distinct = secret
+        .chars()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    secret.chars().count() as f64 * (distinct as f64).log2()
+}
+
 fn hash(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
 }
@@ -172,6 +186,7 @@ struct TokenRow {
     id: i64,
     name: String,
     admin: bool,
+    expires_at: Option<String>,
 }
 
 impl FromRequestParts<PgPool> for Caller {
@@ -190,7 +205,7 @@ impl FromRequestParts<PgPool> for Caller {
                 )
             })?;
         let token: TokenRow = sqlx::query_as(
-            "SELECT id, name, admin FROM tokens
+            "SELECT id, name, admin, expires_at::text FROM tokens
              WHERE hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
         )
         .bind(hash(secret))
@@ -210,6 +225,7 @@ impl FromRequestParts<PgPool> for Caller {
             name: token.name,
             admin: token.admin,
             grants,
+            expires_at: token.expires_at,
         })
     }
 }
@@ -255,9 +271,11 @@ pub async fn create_token(
         )]));
     }
     let secret = match secret {
-        Some(s) if s.len() < 32 => {
+        Some(s) if s.len() < 32 || strength_bits(s) < 128.0 => {
             return Err(ApiError::BadRequest(vec![
-                "a supplied secret must be at least 32 characters".into(),
+                "a supplied secret must be at least 32 characters and about 128 bits strong \
+                 (length × log2 of its distinct characters); generate one with `openssl rand -hex 32`"
+                    .into(),
             ]));
         }
         Some(s) => s.to_string(),
@@ -326,6 +344,7 @@ mod tests {
         Caller {
             name: "t".into(),
             admin: false,
+            expires_at: None,
             grants: grants
                 .iter()
                 .map(|(p, r, s)| Grant::new(p, *r, *s).unwrap())
@@ -356,6 +375,7 @@ mod tests {
         let admin = Caller {
             name: "a".into(),
             admin: true,
+            expires_at: None,
             grants: vec![],
         };
         assert_eq!(admin.role(&zone("x.test")), Some(Role::Owner));
@@ -389,5 +409,11 @@ mod tests {
         assert!(Grant::parse_cli("bad..name:viewer").is_err());
         assert_eq!(hash("abc"), hash("abc"));
         assert_ne!(hash("abc"), hash("abd"));
+
+        // Supplied secrets: repetitive ones are too weak, random or varied ones pass.
+        assert!(strength_bits(&"a".repeat(64)) < 128.0);
+        assert!(strength_bits(&"ab".repeat(32)) < 128.0);
+        assert!(strength_bits("0123456789abcdef0123456789abcdef") >= 128.0);
+        assert!(strength_bits("dnsdb_dev_nodes_token_do_not_use_in_production") >= 128.0);
     }
 }

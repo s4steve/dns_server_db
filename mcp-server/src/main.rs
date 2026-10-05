@@ -181,7 +181,7 @@ fn tools() -> Value {
         {
             "name": "whoami",
             "title": "Show my permissions",
-            "description": "Show this server's API token: its name, whether it is an admin, and its grants (zone pattern, role viewer/editor/owner, and whether it may write LUA scripts). Check this before changing zones.",
+            "description": "Show this server's API token: its name, whether it is an admin, when it expires (expires_at; null = never), and its grants (zone pattern, role viewer/editor/owner, and whether it may write LUA scripts). Check this before changing zones.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": read_only,
         },

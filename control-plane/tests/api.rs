@@ -574,6 +574,47 @@ async fn permissions() {
         call(&fresh, "GET", &format!("/zones/{zone}"), None).await.0,
         StatusCode::OK
     );
+
+    // API-minted tokens expire: 90 days by default, at most 365. CLI-minted ones (like the
+    // admin here, and the nodes') don't.
+    assert_eq!(made["expires_in_days"], 90);
+    let (_, me) = call(&fresh, "GET", "/whoami", None).await;
+    assert!(me["expires_at"].is_string(), "{me}");
+    let about_90_days: bool = sqlx::query_scalar(
+        "SELECT expires_at BETWEEN now() + interval '89 days' AND now() + interval '91 days'
+         FROM tokens WHERE name = $1",
+    )
+    .bind(&name)
+    .fetch_one(&admin.pool)
+    .await
+    .unwrap();
+    assert!(about_90_days);
+    assert!(call(&admin, "GET", "/whoami", None).await.1["expires_at"].is_null());
+    for days in [0, 366] {
+        let (status, body) = call(
+            &admin,
+            "POST",
+            "/tokens",
+            Some(json!({ "name": unique("too-long-"), "expires_in_days": days })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{days}: {body}");
+    }
+    // Supplied secrets must be strong, not just long.
+    let weak = control_plane::auth::create_token(
+        &admin.pool,
+        &unique("weak-"),
+        false,
+        &[],
+        Some(&"a".repeat(40)),
+        None,
+        false,
+    )
+    .await;
+    assert!(matches!(
+        weak,
+        Err(control_plane::api::ApiError::BadRequest(_))
+    ));
     let (_, tokens) = call(&admin, "GET", "/tokens", None).await;
     assert!(
         !tokens.to_string().contains(made["token"].as_str().unwrap()),

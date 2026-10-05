@@ -205,13 +205,19 @@ The same command creates scoped tokens, such as one for DNS nodes (read-only, ev
 cargo run -q -p control-plane -- create-token --name dns-nodes --grant '*:viewer'
 ```
 
-To register a value you already have, which suits configuration management, add `--secret-env VAR` to read it from an environment variable. (`--secret VALUE` also works, but the value shows up in `ps` and shell history.) Add `--if-missing` to make the command safe to re-run.
+To register a value you already have, which suits configuration management, add `--secret-env VAR` to read it from an environment variable. (`--secret VALUE` also works, but the value shows up in `ps` and shell history.) A supplied secret must be at least 32 characters and about 128 bits strong, estimated as length × log2(distinct characters). So `aaaa…` is refused; `openssl rand -hex 32` makes a good one. Add `--if-missing` to make the command safe to re-run.
 
 **Managing tokens over the API** (admin only):
-- `POST /tokens` with `{"name", "admin", "grants": [{"pattern", "role", "scripts"}], "expires_in_days"}` returns the secret once.
+- `POST /tokens` with `{"name", "admin", "grants": [{"pattern", "role", "scripts"}], "expires_in_days"}` returns the secret once. These tokens expire after 90 days by default, and `expires_in_days` can be 1–365.
 - `GET /tokens` lists every token, without secrets.
 - `DELETE /tokens/{name}` revokes a token. The row is kept, so its name stays reserved and changelog actors still make sense.
-- `GET /whoami` shows any token its own grants.
+- `GET /whoami` shows any token its own grants and `expires_at` (null for a token that never expires).
+
+**Token lifetimes:**
+- Tokens minted through the API are for people and MCP clients, so they always expire.
+- Tokens minted with `create-token`, such as the DNS nodes', don't, because an expired node token would take every zone down once its SOA EXPIRE passes.
+- Expiry limits how long a *leaked* token stays useful (one left in a config file, shell history or logs). It isn't about brute force: a generated token is 256 random bits, which can't be guessed at any lifetime.
+- To replace a token, mint a new one, switch clients to it, then revoke the old one.
 
 **Clients** read their token from `CONTROL_PLANE_TOKEN`, an environment variable, so it never appears in a process list:
 - DNS nodes need a `*:viewer` token.

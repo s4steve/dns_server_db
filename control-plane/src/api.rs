@@ -1052,8 +1052,17 @@ async fn changelog(
 // ---------- tokens ----------
 
 async fn whoami(caller: Caller) -> Json<Value> {
-    Json(json!({ "name": caller.name, "admin": caller.admin, "grants": caller.grants }))
+    Json(json!({
+        "name": caller.name, "admin": caller.admin, "grants": caller.grants,
+        "expires_at": caller.expires_at,
+    }))
 }
+
+/// Tokens minted through the API (for people and MCP clients) always expire. Expiry limits
+/// how long a leaked token stays useful; brute force isn't the concern, since generated
+/// secrets are 256 random bits. CLI-minted tokens (e.g. the nodes') are exempt.
+const TOKEN_DAYS_DEFAULT: u32 = 90;
+const TOKEN_DAYS_MAX: u32 = 365;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1078,20 +1087,28 @@ async fn create_token(
         .map(|g| Grant::new(&g.pattern, g.role, g.scripts))
         .collect::<Result<Vec<_>, _>>()
         .map_err(bad)?;
+    let days = req.expires_in_days.unwrap_or(TOKEN_DAYS_DEFAULT);
+    if !(1..=TOKEN_DAYS_MAX).contains(&days) {
+        return Err(bad(format!(
+            "expires_in_days must be between 1 and {TOKEN_DAYS_MAX} (default {TOKEN_DAYS_DEFAULT})"
+        )));
+    }
     let secret = auth::create_token(
         &pool,
         &req.name,
         req.admin,
         &grants,
         None,
-        req.expires_in_days,
+        Some(days),
         false,
     )
     .await?
     .expect("if_missing is false");
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "name": req.name, "token": secret, "grants": grants })),
+        Json(json!({
+            "name": req.name, "token": secret, "grants": grants, "expires_in_days": days,
+        })),
     ))
 }
 
