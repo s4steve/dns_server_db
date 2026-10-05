@@ -1,6 +1,7 @@
 //! Managed SPF by flattening: a name's allowed senders (domains such as `_spf.google.com`,
 //! or literal IPs and CIDRs) are resolved into `ip4:`/`ip6:` terms and published as plain
-//! TXT records, so receivers spend one lookup per chunk instead of one per nested include.
+//! TXT records, so receivers spend one lookup per overflow chunk instead of one per nested
+//! include.
 //!
 //! Every receiver gets the same records: queries carry nothing about the sender (no SPF
 //! macros), and the DNS nodes serve them like any other static TXT record.
@@ -268,13 +269,56 @@ fn domain(s: &str) -> Result<String, String> {
     }
 }
 
-/// The TXT records publishing `terms` for `name`: the root record (which includes each
-/// chunk) and the chunks `_spf0.name`, `_spf1.name`, …, as (owner, raw text).
+/// The TXT records publishing `terms` for `name`: the root record and the chunks
+/// `_spf0.name`, `_spf1.name`, …, as (owner, raw text). The root holds as many terms as fit
+/// beside its includes, so a small policy costs a receiver no lookups beyond `name` itself.
 pub fn render(
     name: &Name,
     terms: &[String],
     qualifier: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    let base = name.to_string();
+    let include_len = " include:_spf0.".len() + base.trim_end_matches('.').len();
+    let fixed = "v=spf1 ".len() + qualifier.len();
+    // Fewer includes leave more room in the root, so the first count that fits is the least.
+    for k in 0..=MAX_CHUNKS {
+        let mut room = CHUNK_BYTES.saturating_sub(fixed + k * include_len);
+        let split = terms
+            .iter()
+            .position(|t| {
+                let fits = t.len() < room;
+                room = room.saturating_sub(t.len() + 1);
+                !fits
+            })
+            .unwrap_or(terms.len());
+        let chunks = pack(&terms[split..]);
+        if chunks.len() > k {
+            continue;
+        }
+        let mut root = String::from("v=spf1");
+        for term in &terms[..split] {
+            root.push(' ');
+            root.push_str(term);
+        }
+        let mut out = vec![];
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let owner = format!("_spf{i}.{base}");
+            root.push_str(&format!(" include:{}", owner.trim_end_matches('.')));
+            out.push((owner, chunk));
+        }
+        root.push(' ');
+        root.push_str(qualifier);
+        out.insert(0, (base, root));
+        return Ok(out);
+    }
+    Err(format!(
+        "{} addresses need more than the {MAX_CHUNKS} records that fit SPF's lookup limit",
+        terms.len()
+    ))
+}
+
+/// `terms` packed into `v=spf1` records of at most `CHUNK_BYTES`.
+fn pack(terms: &[String]) -> Vec<String> {
     let mut chunks: Vec<String> = vec![];
     for term in terms {
         match chunks.last_mut() {
@@ -285,25 +329,7 @@ pub fn render(
             _ => chunks.push(format!("v=spf1 {term}")),
         }
     }
-    if chunks.len() > MAX_CHUNKS {
-        return Err(format!(
-            "{} addresses need {} records, more than the {MAX_CHUNKS} that fit SPF's lookup limit",
-            terms.len(),
-            chunks.len()
-        ));
-    }
-    let base = name.to_string();
-    let mut root = String::from("v=spf1");
-    let mut out = vec![];
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let owner = format!("_spf{i}.{base}");
-        root.push_str(&format!(" include:{}", owner.trim_end_matches('.')));
-        out.push((owner, chunk));
-    }
-    root.push(' ');
-    root.push_str(qualifier);
-    out.insert(0, (base, root));
-    Ok(out)
+    chunks
 }
 
 /// Every owner name `render` may produce for `name`, so stale chunks can be found.
@@ -463,21 +489,32 @@ mod tests {
             render(&name, &[], "~all").unwrap(),
             [("example.test.".to_string(), "v=spf1 ~all".to_string())]
         );
+        // A few terms fit in the root itself: no includes, no extra lookups.
+        let few = vec!["ip4:192.0.2.1".to_string(), "ip6:2001:db8::/32".to_string()];
+        assert_eq!(
+            render(&name, &few, "-all").unwrap(),
+            [(
+                "example.test.".to_string(),
+                "v=spf1 ip4:192.0.2.1 ip6:2001:db8::/32 -all".to_string()
+            )]
+        );
+
+        // More fill the root first and overflow into chunks it includes, in order.
         let terms: Vec<String> = (0..60).map(|i| format!("ip4:192.0.{i}.0/24")).collect();
         let out = render(&name, &terms, "-all").unwrap();
-        assert_eq!(out.len(), 4); // root + 3 chunks
-        assert_eq!(
-            out[0].1,
-            "v=spf1 include:_spf0.example.test include:_spf1.example.test include:_spf2.example.test -all"
-        );
+        assert_eq!(out.len(), 3); // root + 2 chunks
+        assert!(out[0].1.starts_with("v=spf1 ip4:192.0.0.0/24 "));
         assert!(
-            out[1..]
-                .iter()
-                .all(|(n, t)| n.starts_with("_spf") && t.len() <= CHUNK_BYTES)
+            out[0]
+                .1
+                .ends_with(" include:_spf0.example.test include:_spf1.example.test -all")
         );
-        let joined: Vec<&str> = out[1..]
+        assert!(out.iter().all(|(_, t)| t.len() <= CHUNK_BYTES));
+        assert!(out[1..].iter().all(|(n, _)| n.starts_with("_spf")));
+        let joined: Vec<&str> = out
             .iter()
             .flat_map(|(_, t)| t.split(' ').skip(1))
+            .filter(|t| t.starts_with("ip4:"))
             .collect();
         assert_eq!(joined, terms.iter().map(String::as_str).collect::<Vec<_>>());
 

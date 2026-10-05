@@ -101,17 +101,17 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json
   -d '{"senders": ["_spf.google.com", "sendgrid.net", "192.0.2.0/24"], "qualifier": "~all"}'
 ```
 
-For a name `N`, that publishes:
+For a name `N`, that publishes the terms in `N`'s own record, overflowing into chunks it includes only when they don't fit:
 
 ```
-N          TXT "v=spf1 include:_spf0.N include:_spf1.N ~all"
+N          TXT "v=spf1 ip4:… ip6:… include:_spf0.N include:_spf1.N ~all"
 _spf0.N    TXT "v=spf1 ip4:… ip4:… ip6:…"
 _spf1.N    TXT "v=spf1 …"
 ```
 
 - **Senders** are domains to flatten, or literal `ip4:`/`ip6:` terms, bare IPs or CIDRs.
 - **Qualifier** is `~all` (the default), `-all` or `?all`.
-- **Lookups:** each chunk is at most 450 bytes, and there are at most 9 chunks, so receivers use 9 lookups or fewer.
+- **Lookups:** the root and each chunk are at most 450 bytes, and there are at most 9 chunks, so receivers use 9 lookups or fewer. A policy that fits in the root uses none.
 - **Other TXT records** at `N` are kept. `N`'s own `v=spf1` record and the `_spf0`–`_spf8` names are managed, so hand edits to them get overwritten.
 - **Refresh:** every `SPF_REFRESH_SECS` (default 900), the control plane re-resolves every policy and commits only when the records change (actor `spf-refresh`).
 - **Failures:** if a refresh fails, the last good records stay and the policy's `last_error` is set. A `PUT` that can't be flattened is rejected and stores nothing.
@@ -119,6 +119,27 @@ _spf1.N    TXT "v=spf1 …"
 - **Exclusions:** `-`/`~`/`?` terms inside included records are dropped rather than kept as exclusions.
 - **Permissions:** writing a policy needs editor on the zone; reading one needs viewer.
 - **No per-message answers:** every receiver gets the same answer, and queries carry nothing about the sender. Answering SPF macro queries per sender was considered and left out, because it appears to be covered by Valimail's US patents (e.g. US 9,762,618 and its continuations, expiring around 2036).
+
+### Managed SPF for another app
+
+An app (such as a DMARC dashboard) can publish policies for its own customers in one shared zone. Each customer then adds a single `include:` to their real SPF record, and the app needs no access to the customer's DNS.
+
+1. Create the zone and delegate it at the registrar to the DNS nodes:
+
+   ```bash
+   curl -X POST -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+     https://cp.example.net/zones -d '{"name": "spf.example.net.", "ns": ["ns1.example.net.", "ns2.example.net."]}'
+   ```
+
+2. Give the app a token that is editor on that zone only, never admin:
+
+   ```bash
+   control-plane create-token --name dmarc-app --grant spf.example.net.:editor
+   ```
+
+3. The app `PUT`s each customer's policy at a name it chooses, e.g. `acme-3f9a1c.spf.example.net`. Use unguessable names if the app doesn't verify domain ownership, so one customer can't set the senders another customer's SPF includes.
+
+A customer's `include:` costs one lookup per record: the root plus any chunks. `PUT` and `GET` return that count as `records`.
 
 ## MCP server
 

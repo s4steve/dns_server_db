@@ -703,30 +703,41 @@ async fn managed_spf() {
     let start = log_after(&admin, &format!("{zone}."), 0).await;
     let start_seq = start.last().unwrap()["seq"].as_i64().unwrap();
 
-    // 60 networks need three chunks. The hand-written v=spf1 record is replaced; the other
-    // TXT record at the name is kept.
+    // 60 networks fill the root and overflow into chunks it includes. The hand-written
+    // v=spf1 record is replaced; the other TXT record at the name is kept.
     let many: Vec<String> = (0..60).map(|i| format!("192.0.{i}.0/24")).collect();
     let (status, body) = call(&editor, "PUT", &policy, Some(json!({ "senders": many }))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["terms"].as_array().unwrap().len(), 60);
     let (txt, _) = txt_records(&admin, &zone).await;
-    let owners: Vec<&str> = txt.iter().map(|(o, _)| o.as_str()).collect();
-    assert_eq!(
-        owners,
-        ["_spf0.mail", "_spf1.mail", "_spf2.mail", "mail", "mail"]
-    );
     assert!(txt.contains(&("mail".into(), "\"site-verification=abc\"".into())));
-    assert!(txt.contains(&(
-        "mail".into(),
-        format!("\"v=spf1 include:_spf0.mail.{zone} include:_spf1.mail.{zone} include:_spf2.mail.{zone} ~all\"")
-    )));
-    assert!(
-        txt[0]
-            .1
-            .starts_with("\"v=spf1 ip4:192.0.0.0/24 ip4:192.0.1.0/24 ")
-    );
+    let unquote = |d: &str| d.replace("\" \"", "").trim_matches('"').to_string();
+    let root = txt
+        .iter()
+        .find(|(o, d)| o == "mail" && d.starts_with("\"v=spf1"))
+        .map(|(_, d)| unquote(d))
+        .unwrap();
+    let chunks: Vec<String> = txt
+        .iter()
+        .filter(|(o, _)| o.starts_with("_spf"))
+        .map(|(_, d)| unquote(d))
+        .collect();
+    assert!(!chunks.is_empty());
+    assert_eq!(txt.len(), 2 + chunks.len());
+    let includes: String = (0..chunks.len())
+        .map(|i| format!(" include:_spf{i}.mail.{zone}"))
+        .collect();
+    assert!(root.starts_with("v=spf1 ip4:192.0.0.0/24 "), "{root}");
+    assert!(root.ends_with(&format!("{includes} ~all")), "{root}");
+    let published = std::iter::once(&root)
+        .chain(&chunks)
+        .flat_map(|r| r.split(' '))
+        .filter(|t| t.starts_with("ip4:"))
+        .count();
+    assert_eq!(published, 60);
 
-    // Fewer senders: the extra chunks are deleted. The same policy again changes nothing.
+    // Fewer senders fit in the root, so the chunks are deleted. The same policy again
+    // changes nothing.
     let few = json!({ "senders": ["ip4:198.51.100.7", "2001:db8::/48"], "qualifier": "-all" });
     let (status, body) = call(&editor, "PUT", &policy, Some(few.clone())).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -734,14 +745,10 @@ async fn managed_spf() {
     assert_eq!(
         txt,
         [
-            (
-                "_spf0.mail".into(),
-                "\"v=spf1 ip4:198.51.100.7 ip6:2001:db8::/48\"".into()
-            ),
-            ("mail".into(), "\"site-verification=abc\"".into()),
+            ("mail".to_string(), "\"site-verification=abc\"".to_string()),
             (
                 "mail".into(),
-                format!("\"v=spf1 include:_spf0.mail.{zone} -all\"")
+                "\"v=spf1 ip4:198.51.100.7 ip6:2001:db8::/48 -all\"".into()
             ),
         ]
     );
@@ -770,15 +777,19 @@ async fn managed_spf() {
         body["terms"],
         json!(["ip4:198.51.100.7", "ip6:2001:db8::/48"])
     );
+    assert_eq!(body["records"], 1);
     let (status, _) = call(&viewer, "DELETE", &policy, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // A refresh repairs a hand-deleted chunk, as actor spf-refresh.
+    // A refresh repairs a hand-deleted record, as actor spf-refresh.
     let (status, body) = call(
         &editor,
         "POST",
         &format!("/zones/{zone}/changes"),
-        Some(json!({ "changes": [{ "action": "delete", "name": "_spf0.mail", "type": "TXT" }] })),
+        Some(json!({ "changes": [{
+            "action": "delete", "name": "mail", "type": "TXT",
+            "data": "\"v=spf1 ip4:198.51.100.7 ip6:2001:db8::/48 -all\"",
+        }] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
