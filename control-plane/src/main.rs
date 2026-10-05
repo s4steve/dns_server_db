@@ -2,7 +2,7 @@ use control_plane::auth::{self, Grant};
 use tokio::net::TcpListener;
 
 const USAGE: &str = "usage:
-  control-plane                serve the API (LISTEN, DATABASE_URL)
+  control-plane                serve the API (LISTEN, DATABASE_URL, SPF_REFRESH_SECS=900)
   control-plane create-token --name NAME [--admin] [--grant PATTERN:ROLE[:scripts]]...
                              [--secret VALUE] [--if-missing]
 
@@ -28,6 +28,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let listen = std::env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:8053".into());
             let listener = TcpListener::bind(&listen).await?;
             println!("control plane listening on http://{listen}");
+            let every = std::env::var("SPF_REFRESH_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900);
+            let refresh_pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(every));
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = control_plane::api::refresh_spf(&refresh_pool).await {
+                        eprintln!("spf refresh: {e}");
+                    }
+                }
+            });
             axum::serve(listener, control_plane::api::router(pool)).await?;
         }
         Some("create-token") => {

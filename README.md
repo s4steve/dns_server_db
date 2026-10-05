@@ -9,6 +9,7 @@ See [PLAN.md](PLAN.md) for the full design, decisions, and staged roadmap.
 **All planned stages are done (Stage 5, ALIAS, was skipped and can be added later).** The last one, Stage 7, added an MCP server so AI assistants can manage zones through the same validated API. See [MCP server](#mcp-server).
 
 Already in place:
+- **Managed SPF:** flattens a domain's allowed senders into TXT records that stay under SPF's 10-lookup limit. See [Managed SPF](#managed-spf).
 - **Operations (Stage 6):** Prometheus metrics, a health check for anycast, response rate limiting, DNS cookies, and a load test. See [Operations](#operations).
 - **LuaJIT tailoring (Stage 4):** `LUA` records hold scripts that build answers per query. See [LUA records](#lua-records).
 - **Replication (Stage 3):** DNS nodes follow the control plane's changelog, and a change reaches every node in about a second.
@@ -83,6 +84,35 @@ Answers that don't come from a script carry ECS scope 0, so resolvers can cache 
 cargo test --release -p dns-server -- --ignored --nocapture script_latency
 ```
 
+## Managed SPF
+
+SPF lets a receiver follow at most 10 DNS lookups. A domain that sends through several providers (`include:_spf.google.com`, `include:sendgrid.net`, …) can exceed that and fail SPF. Managed SPF **flattens** the list instead: the control plane resolves each sender's SPF record, recursively, into `ip4:`/`ip6:` terms and publishes them as plain TXT records.
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  localhost:8053/zones/example.com/spf/@ \
+  -d '{"senders": ["_spf.google.com", "sendgrid.net", "192.0.2.0/24"], "qualifier": "~all"}'
+```
+
+For a name `N`, that publishes:
+
+```
+N          TXT "v=spf1 include:_spf0.N include:_spf1.N ~all"
+_spf0.N    TXT "v=spf1 ip4:… ip4:… ip6:…"
+_spf1.N    TXT "v=spf1 …"
+```
+
+- **Senders** are domains to flatten, or literal `ip4:`/`ip6:` terms, bare IPs or CIDRs.
+- **Qualifier** is `~all` (the default), `-all` or `?all`.
+- **Lookups:** each chunk is at most 450 bytes, and there are at most 9 chunks, so receivers use 9 lookups or fewer.
+- **Other TXT records** at `N` are kept. `N`'s own `v=spf1` record and the `_spf0`–`_spf8` names are managed, so hand edits to them get overwritten.
+- **Refresh:** every `SPF_REFRESH_SECS` (default 900), the control plane re-resolves every policy and commits only when the records change (actor `spf-refresh`).
+- **Failures:** if a refresh fails, the last good records stay and the policy's `last_error` is set. A `PUT` that can't be flattened is rejected and stores nothing.
+- **What can't be flattened:** senders whose records use `exists:`, `ptr` or macros are rejected, because those depend on the individual message.
+- **Exclusions:** `-`/`~`/`?` terms inside included records are dropped rather than kept as exclusions.
+- **Permissions:** writing a policy needs editor on the zone; reading one needs viewer.
+- **No per-message answers:** every receiver gets the same answer, and queries carry nothing about the sender. Answering SPF macro queries per sender was considered and left out, because it appears to be covered by Valimail's US patents (e.g. US 9,762,618 and its continuations, expiring around 2036).
+
 ## MCP server
 
 `mcp-server` lets MCP clients (Claude Code, Claude Desktop and others) manage zones. It speaks MCP over stdio and calls the control plane's REST API over HTTP. It holds no logic of its own: every change goes through the API's validation and atomic changesets. When the API rejects a change, the tool returns the API's error messages, so the model can correct the request and retry.
@@ -96,6 +126,9 @@ cargo test --release -p dns-server -- --ignored --nocapture script_latency
 | `delete_zone` | `DELETE /zones/{zone}` | Deletes a zone (marked destructive) |
 | `apply_changes` | `POST /zones/{zone}/changes` | Applies an atomic changeset; its description explains `LUA` records (marked destructive) |
 | `get_changelog` | `GET /changelog` | Reads changelog entries for zones the token can see, including who made each change (read-only) |
+| `get_spf_policy` | `GET /zones/{zone}/spf/{name}` | Shows a managed SPF policy, its flattened terms and any refresh error (read-only) |
+| `set_spf_policy` | `PUT /zones/{zone}/spf/{name}` | Creates or replaces a managed SPF policy; flattens its senders now (marked destructive) |
+| `delete_spf_policy` | `DELETE /zones/{zone}/spf/{name}` | Deletes a policy and its TXT records (marked destructive) |
 | `whoami` | `GET /whoami` | Shows the token's name and grants (read-only) |
 
 Build it and register it with Claude Code:
@@ -253,6 +286,7 @@ A Cargo workspace with three crates:
 - `control-plane/`: the REST API over Postgres
   - `src/api.rs`: routes, transactions, serial bumps, changelog, token endpoints
   - `src/auth.rs`: tokens, grants, roles, request authentication
+  - `src/spf.rs`: SPF flattening and chunked TXT rendering
   - `src/validate.rs`: record parsing, canonical forms, validation rules
   - `migrations/`: the schema, applied automatically at startup
   - `tests/api.rs`: end-to-end test against Postgres
@@ -307,6 +341,7 @@ curl -X POST localhost:8053/zones/example.com/changes -H "authorization: Bearer 
 | `DELETE` | `/zones/{zone}` | Delete the zone |
 | `POST` | `/zones/{zone}/changes` | `{"changes":[...]}`, each `add` (name, type, data, optional ttl) or `delete` (name, type, optional data; without data, deletes the whole RRset) |
 | `GET` | `/changelog?after=SEQ&limit=N` | Changelog entries after `SEQ`, oldest first, for zones the token can see. Each has an `actor`; continue from `next_after`. |
+| `PUT`, `GET`, `DELETE` | `/zones/{zone}/spf/{name}` | Managed SPF policy: `{"senders": [...], "qualifier"}` (see [Managed SPF](#managed-spf)) |
 | `GET` | `/whoami` | The calling token's name and grants |
 | `POST`, `GET`, `DELETE` | `/tokens`, `/tokens/{name}` | Token management (admin) |
 

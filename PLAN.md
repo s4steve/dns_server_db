@@ -42,6 +42,7 @@ the server runs, and it can tailor each answer with in-process scripts.
 | ECS | Tailored answers carry an ECS scope equal to the client's prefix, so resolvers cache them per subnet. Answers that aren't tailored carry scope 0. |
 | TTL | Per record. A record added without a TTL takes its RRset's TTL, otherwise the zone default (300). |
 | Geo | No GeoIP database. Scripts match the client's network with `in_cidr`. |
+| Managed SPF | The control plane flattens a sender list per name into `ip4`/`ip6` terms and publishes them as plain TXT records: the name's `v=spf1` record, which includes up to 9 chunks of 450 bytes or less named `_spf0`–`_spf8`. It re-resolves every `SPF_REFRESH_SECS`, commits only on change, and keeps the last good records on failure. Per-sender answers to SPF macro queries were rejected: they appear to be covered by Valimail's US 9,762,618 family (priority 2015, expiring around 2036). This is a reading of the claims, not legal advice. |
 | Ops | Prometheus `/metrics` and `/health` on `--http`; RRL modelled on BIND; DNS cookies (RFC 7873 with RFC 9018 server cookies). |
 | MCP | A stdio JSON-RPC server written directly (no SDK); a thin HTTP client of the REST API. |
 | Out of scope | Recursion, caching, DoT/DoH, zone transfers, DNSSEC, ALIAS |
@@ -112,8 +113,13 @@ Each stage ended with something runnable and a test that fails if it breaks.
 - The DNS nodes, the MCP server (now with a `whoami` tool, for eight tools in total) and the compose setup all authenticate.
 - A `permissions` API test covers 401, 404 versus 403, each role, the `scripts` grant, zone creation by pattern, token management and revocation, and the changelog actor.
 
+**After the stages: managed SPF. ✅**
+- `PUT/GET/DELETE /zones/{zone}/spf/{name}` and a background refresher in the control plane. Writes go through the normal change path, so validation, serial bumps, the changelog and the actor are reused, and the DNS nodes needed no changes.
+- The MCP server has `get_spf_policy`, `set_spf_policy` and `delete_spf_policy` tools, for eleven tools in total.
+- Senders using `exists:`, `ptr` or macros are rejected. Non-pass terms in included records are dropped.
+
 ## Verification
-- **Unit and integration tests:** 19 across the workspace (`cargo test`, with Postgres from `docker compose up -d`). They cover the golden answers, follower apply and expiry, `LUA` behaviour and sandbox escapes, RRL, cookies, metrics and health, control-plane validation and the API end to end, access control, and the MCP server over stdio, including token scopes.
+- **Unit and integration tests:** 23 across the workspace (`cargo test`, with Postgres from `docker compose up -d`). They cover the golden answers, follower apply and expiry, `LUA` behaviour and sandbox escapes, RRL, cookies, metrics and health, control-plane validation and the API end to end, access control, SPF flattening, and the MCP server over stdio, including token scopes.
 - **Multi-node:** `scripts/multinode-test.sh` covers propagation, REFRESH repair, `LUA` scripts on each node, health, metrics, cookies across nodes, expiry and recovery.
 - **Load:** `loadgen` plus the release-mode `script_latency` benchmark.
 - **Not done from the original plan:** no CI pipeline is set up, and no `zonemaster` or `dnsviz` checks have been run against a public zone.

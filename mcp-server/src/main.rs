@@ -35,6 +35,7 @@ fn tools() -> Value {
         },
         "additionalProperties": false,
     });
+    let spf_name = json!({ "type": "string", "description": "Name in the zone: \"@\" for the apex, or relative (\"mail\")" });
     let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
     let write = |destructive: bool| json!({ "readOnlyHint": false, "destructiveHint": destructive, "openWorldHint": false });
     json!([
@@ -143,6 +144,40 @@ fn tools() -> Value {
             "annotations": read_only,
         },
         {
+            "name": "get_spf_policy",
+            "title": "Get managed SPF policy",
+            "description": "Get the managed SPF policy at a name: its senders, qualifier, the flattened ip4/ip6 terms currently published, and last_error if the latest background refresh failed.",
+            "inputSchema": { "type": "object", "properties": { "zone": zone, "name": spf_name }, "required": ["zone", "name"], "additionalProperties": false },
+            "annotations": read_only,
+        },
+        {
+            "name": "set_spf_policy",
+            "title": "Set managed SPF policy",
+            "description": "Create or replace the managed SPF policy at a name. The control plane resolves each sender's SPF record now (following includes, redirects, a and mx) into ip4/ip6 terms and publishes them as plain TXT records that stay under SPF's 10-lookup limit: the name's v=spf1 record, which includes up to 9 chunk records named _spf0.<name> to _spf8.<name>. It replaces any existing v=spf1 TXT record at the name and keeps other TXT records. It re-resolves periodically. Senders whose records use exists:, ptr or macros are rejected. Needs editor on the zone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "zone": zone,
+                    "name": spf_name,
+                    "senders": {
+                        "type": "array", "minItems": 1, "items": { "type": "string" },
+                        "description": "Domains to flatten (e.g. \"_spf.google.com\", \"sendgrid.net\"), or literal \"ip4:192.0.2.0/24\", \"ip6:2001:db8::/32\", bare IPs or CIDRs",
+                    },
+                    "qualifier": { "type": "string", "enum": ["~all", "-all", "?all"], "description": "How to treat senders not listed (default ~all)" },
+                },
+                "required": ["zone", "name", "senders"],
+                "additionalProperties": false,
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true },
+        },
+        {
+            "name": "delete_spf_policy",
+            "title": "Delete managed SPF policy",
+            "description": "Delete the managed SPF policy at a name, along with the TXT records it published (the name's v=spf1 record and its _spfN chunks). Other TXT records are kept. The name then has no SPF record.",
+            "inputSchema": { "type": "object", "properties": { "zone": zone, "name": spf_name }, "required": ["zone", "name"], "additionalProperties": false },
+            "annotations": write(true),
+        },
+        {
             "name": "whoami",
             "title": "Show my permissions",
             "description": "Show this server's API token: its name, whether it is an admin, and its grants (zone pattern, role viewer/editor/owner, and whether it may write LUA scripts). Check this before changing zones.",
@@ -191,6 +226,11 @@ impl Api {
                 .post(&url)
                 .header("Authorization", &auth)
                 .send_json(b),
+            ("PUT", Some(b)) => self
+                .agent
+                .put(&url)
+                .header("Authorization", &auth)
+                .send_json(b),
             ("PATCH", Some(b)) => self
                 .agent
                 .patch(&url)
@@ -235,6 +275,22 @@ fn zone_arg(args: &Value) -> Result<String, String> {
     Ok(zone.to_string())
 }
 
+/// `/zones/{zone}/spf/{name}`. Names never need escaping; anything else is refused.
+fn spf_path(args: &Value) -> Result<String, String> {
+    let zone = zone_arg(args)?;
+    let name = args["name"]
+        .as_str()
+        .ok_or("missing required argument: name")?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_@".contains(c))
+    {
+        return Err(format!("invalid name {name:?}"));
+    }
+    Ok(format!("/zones/{zone}/spf/{name}"))
+}
+
 /// Runs a tool. `None` = no such tool.
 fn call_tool(api: &Api, name: &str, args: &Value) -> Option<Result<Value, String>> {
     let with_zone = |f: &dyn Fn(String) -> Result<Value, String>| zone_arg(args).and_then(f);
@@ -253,6 +309,15 @@ fn call_tool(api: &Api, name: &str, args: &Value) -> Option<Result<Value, String
             let body = json!({ "changes": args["changes"] });
             api.call("POST", &format!("/zones/{z}/changes"), Some(&body))
         }),
+        "get_spf_policy" => spf_path(args).and_then(|p| api.call("GET", &p, None)),
+        "set_spf_policy" => spf_path(args).and_then(|p| {
+            let mut body = json!({ "senders": args["senders"] });
+            if let Some(q) = args.get("qualifier") {
+                body["qualifier"] = q.clone();
+            }
+            api.call("PUT", &p, Some(&body))
+        }),
+        "delete_spf_policy" => spf_path(args).and_then(|p| api.call("DELETE", &p, None)),
         "get_changelog" => {
             let after = args["after"].as_u64().unwrap_or(0);
             let limit = args["limit"].as_u64().unwrap_or(100);
