@@ -72,17 +72,20 @@ Answers that don't come from a script carry ECS scope 0, so resolvers can cache 
 **Scripts can answer:** A, AAAA, TXT, MX or CAA, with at most one script per type at a name. A `LUA` record counts as a record for CNAME exclusivity. The control plane compiles each script with LuaJIT before accepting it.
 
 **Sandbox:**
-- There's one Lua state per worker thread, and each script has its own globals.
+- Each query thread runs its scripts on its own runner thread, which has one Lua state. Each script has its own globals.
 - The shared libraries are read-only.
 - No `io`, `os`, `require`, `load`, `debug`, `ffi` or `pcall`, and source text only (never precompiled bytecode).
 - Scripts are at most 16 KiB, and `string.rep` builds at most 64 KiB.
-- Each call has a budget of 200k instructions, and each state has a 64 MiB memory limit. Where LuaJIT won't use mlua's allocator (e.g. aarch64 Linux), the limit is checked every 100 instructions, so a script can briefly overshoot it.
-- Limits: the budget can't interrupt C functions such as string pattern matching, and scripts run on the node's worker threads. A script that hangs inside one blocks that thread on every node. Grant `scripts` only to tokens you'd trust with the nodes themselves.
+- Each call has a budget of 200k instructions, and each state has a 64 MiB memory limit. Where LuaJIT won't use mlua's allocator (e.g. aarch64 Linux), the limit is checked every 100 instructions, so a single C call (such as a huge concatenation) can briefly overshoot it.
+- Each call also has a 100 ms wall-clock limit, which covers time spent inside C functions such as pattern matching, where the instruction budget can't reach.
+  - A script that exceeds it is disabled on that node until the node restarts or the script changes, and `dns_lua_timeouts_total` counts it.
+  - The runner thread stuck in it is abandoned and replaced, so a query thread is never held longer than the limit.
+- Scripts still run code on every node, so grant `scripts` only to tokens you'd trust with the nodes themselves.
 - LuaJIT's JIT compiler is off. The instruction budget can't interrupt JIT-compiled code, so a runaway loop could otherwise never be stopped.
 
 `LUA` records themselves are never served, not even to ANY queries.
 
-**Latency** in release builds, measuring complete `answer()` calls with ECS: static p99 2.7µs, script p99 9.2µs. Reproduce with:
+**Latency** in release builds, measuring complete `answer()` calls with ECS: static p99 2.8µs, script p99 17.4µs. Handing each script call to the runner thread adds about 5–8µs. Reproduce with:
 
 ```bash
 cargo test --release -p dns-server -- --ignored --nocapture script_latency
@@ -158,7 +161,7 @@ Or, in a project's `.mcp.json`. Reference the token from your environment rather
 }
 ```
 
-`CONTROL_PLANE_URL` defaults to `http://127.0.0.1:8053`.
+`CONTROL_PLANE_URL` defaults to `http://127.0.0.1:8053`. Other hosts need `https://` (see [Control plane](#control-plane)).
 
 The MCP server can do exactly what its token allows (see [Access control](#access-control)), and the `whoami` tool shows the model what that is. Give it a token scoped to the zones it should manage, and leave out `scripts` unless it should write `LUA` records.
 
@@ -250,7 +253,7 @@ process dns-health {
 - `dns_queries_total{transport,rcode}`
 - `dns_query_duration_seconds`: a histogram of the time spent building each answer
 - truncations, RRL drops and slips, valid cookies
-- Lua runs and errors
+- Lua runs, errors and timeouts
 - follower errors and REFRESH repairs
 - gauges: `dns_zones`, `dns_zones_expired`, `dns_healthy`, `dns_follow_applied_seq`, `dns_follow_sync_age_seconds`
 
@@ -273,6 +276,8 @@ process dns-health {
 | `LUA` script | 4 | 84,975 | 43µs | 91µs | 122µs |
 | Static | 16 | 73,308 | 211µs | 400µs | 557µs |
 | `LUA` script | 16 | 78,548 | 196µs | 386µs | 675µs |
+
+The `LUA` rows were measured before scripts moved to runner threads, which add about 5–8µs per script call.
 
 With more client threads, throughput levels off around 71–78k QPS on macOS, because every worker shares one UDP socket. On Linux, one `SO_REUSEPORT` socket per core is the next step (marked in the code). On the server side, 99.98% of 1.55M queries took under 100µs to answer.
 
@@ -329,6 +334,11 @@ cargo test
 Listens on `127.0.0.1:8053`. Override with the `LISTEN` and `DATABASE_URL` environment variables. Every request needs a token; mint the first one with `create-token` (see [Access control](#access-control)).
 
 The API serves plain HTTP. Anywhere beyond localhost, put it behind a reverse proxy that terminates TLS and rate-limits clients, and point nodes and the MCP server at `https://`. Tokens, and the changelog with its `LUA` scripts, would otherwise cross the network in the clear.
+
+DNS nodes (`--follow`) and the MCP server enforce this:
+- They refuse a plain `http://` URL unless its host is `localhost` or a loopback address.
+- On a trusted private network, `CONTROL_PLANE_ALLOW_HTTP=1` allows plain HTTP. The compose setup sets it for its nodes.
+- Certificates are checked against the public web PKI roots, so the proxy needs a publicly trusted certificate.
 
 **Limits:**
 - 64 requests at once; beyond that, requests get 503.

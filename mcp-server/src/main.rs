@@ -378,6 +378,38 @@ fn handle(api: &Api, msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
+/// Whether `url` is safe to send the token and changelog to: `https://`, or plain `http://`
+/// only to a loopback host unless `allow_http` (CONTROL_PLANE_ALLOW_HTTP=1, for trusted
+/// networks such as the compose setup). Tokens and LUA scripts must not cross a network in
+/// the clear.
+// ponytail: the same check lives in dns-server/src/main.rs; share a crate if a third client appears.
+fn check_transport(url: &str, allow_http: bool) -> Result<(), String> {
+    let uri: ureq::http::Uri = url
+        .parse()
+        .map_err(|e| format!("invalid control plane URL {url:?}: {e}"))?;
+    let host = uri.host().unwrap_or("");
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match uri.scheme_str() {
+        Some("https") => Ok(()),
+        Some("http") if loopback || allow_http => Ok(()),
+        Some("http") => Err(format!(
+            "refusing plain http:// to {host}: use https:// (TLS), or set CONTROL_PLANE_ALLOW_HTTP=1 on a trusted network"
+        )),
+        _ => Err(format!(
+            "control plane URL {url:?} must start with https://"
+        )),
+    }
+}
+
+fn allow_http() -> bool {
+    std::env::var("CONTROL_PLANE_ALLOW_HTTP").is_ok_and(|v| v == "1")
+}
+
 fn main() {
     let base =
         std::env::var("CONTROL_PLANE_URL").unwrap_or_else(|_| "http://127.0.0.1:8053".into());
@@ -387,6 +419,10 @@ fn main() {
         .filter(|t| !t.is_empty());
     if token.is_none() {
         eprintln!("warning: CONTROL_PLANE_TOKEN is not set; the API will refuse every call");
+    }
+    if let Err(e) = check_transport(&base, allow_http()) {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
     let api = Api::new(&base, token);
     let mut out = std::io::stdout().lock();
@@ -403,5 +439,31 @@ fn main() {
             let _ = writeln!(out, "{r}");
             let _ = out.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport() {
+        for ok in [
+            "https://cp.example.net",
+            "http://127.0.0.1:8053",
+            "http://localhost:8053",
+            "http://[::1]:8053",
+        ] {
+            assert!(check_transport(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://cp.example.net",
+            "http://192.0.2.1:8053",
+            "ftp://127.0.0.1",
+            "nonsense",
+        ] {
+            assert!(check_transport(bad, false).is_err(), "{bad}");
+        }
+        assert!(check_transport("http://control-plane:8053", true).is_ok());
     }
 }

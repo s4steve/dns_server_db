@@ -34,6 +34,7 @@ pub static RRL_SLIPPED: AtomicU64 = AtomicU64::new(0);
 pub static COOKIES_VALID: AtomicU64 = AtomicU64::new(0);
 pub static LUA_RUNS: AtomicU64 = AtomicU64::new(0);
 pub static LUA_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static LUA_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static FOLLOW_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static REFRESH_REPAIRS: AtomicU64 = AtomicU64::new(0);
 static LATENCY: [AtomicU64; BUCKETS_US.len() + 1] =
@@ -165,6 +166,11 @@ pub fn render(store: &Store) -> String {
             "dns_lua_errors_total",
             "LUA script runs that failed (error, bad output, budget).",
             &LUA_ERRORS,
+        ),
+        (
+            "dns_lua_timeouts_total",
+            "LUA scripts that exceeded the time limit and were disabled on this node.",
+            &LUA_TIMEOUTS,
         ),
         (
             "dns_follow_errors_total",

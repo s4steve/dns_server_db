@@ -15,16 +15,26 @@
 //! It returns record data in zone-file syntax: one string, or a list of strings. `nil` (or
 //! an empty list) means "no tailored answer": the static records are served instead.
 //!
-//! Sandbox: one Lua state per worker thread (LuaJIT states aren't thread-safe), each script
-//! in its own environment over a read-only base of `math`, `string`, `table`, a few safe
-//! builtins and `in_cidr(ip, "10.0.0.0/8")`. No `io`, `os`, `require`, `debug`, `ffi`, `load`
-//! or `pcall` (which could catch the budget error). Source text only, never bytecode. Each call
-//! gets an instruction budget, the state has a memory limit, and `string.rep` output is capped.
+//! Sandbox: each query thread hands its scripts to its own runner thread, which owns one Lua
+//! state (LuaJIT states aren't thread-safe). Each script runs in its own environment over a
+//! read-only base of `math`, `string`, `table`, a few safe builtins and
+//! `in_cidr(ip, "10.0.0.0/8")`. No `io`, `os`, `require`, `debug`, `ffi`, `load` or `pcall`
+//! (which could catch the budget error). Source text only, never bytecode. Each call gets an
+//! instruction budget and a wall-clock limit, the state has a memory limit, and `string.rep`
+//! output is capped.
+//!
+//! The wall-clock limit covers what the instruction budget can't: time spent inside C
+//! functions (pattern matching, big concatenations). A script that exceeds it is disabled on
+//! this node, and its runner thread is abandoned and replaced, so a hung script never holds a
+//! query thread for longer than the limit.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::rc::Rc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{LazyLock, RwLock};
+use std::time::Duration;
 
 use hickory_proto::rr::rdata::NULL;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -75,15 +85,19 @@ const HOOK_EVERY: u32 = 100;
 const MEMORY_LIMIT: usize = 64 << 20; // per worker thread
 /// Largest string `string.rep` may build. It runs in C, where the instruction budget can't stop it.
 const MAX_REP_BYTES: usize = 64 * 1024;
+/// Wall-clock limit per call, including time in C functions. Well-behaved scripts take
+/// microseconds; this only has to stay under resolvers' retry timeouts.
+const TIME_LIMIT: Duration = Duration::from_millis(100);
 // ponytail: unbounded per-thread compile cache; scripts are few. Evict if that changes.
 
-pub struct Input<'a> {
-    pub qname: &'a str,
-    pub qtype: &'a str,
+#[derive(Clone)]
+pub struct Input {
+    pub qname: String,
+    pub qtype: String,
     pub client: IpAddr,
     pub client_prefix: u8,
     pub source: IpAddr,
-    pub node: &'a str,
+    pub node: String,
     pub statics: Vec<String>,
 }
 
@@ -101,23 +115,83 @@ struct Engine {
     instructions: Rc<Cell<u64>>,
 }
 
-thread_local! {
-    static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+/// A thread that runs one query thread's scripts, one call at a time, so a call never waits
+/// in a queue and the time limit measures only the script.
+struct Runner {
+    jobs: mpsc::Sender<(String, Input)>,
+    results: mpsc::Receiver<Outcome>,
 }
 
+impl Runner {
+    fn spawn() -> std::io::Result<Runner> {
+        let (jobs, job_rx) = mpsc::channel::<(String, Input)>();
+        let (result_tx, results) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("lua".into())
+            .spawn(move || {
+                let mut engine = Engine::new();
+                for (source, input) in job_rx {
+                    let outcome = match &mut engine {
+                        Ok(e) => e
+                            .call(&source, &input)
+                            .unwrap_or_else(|e| Outcome::Error(e.to_string())),
+                        Err(e) => Outcome::Error(format!("starting Lua: {e}")),
+                    };
+                    if result_tx.send(outcome).is_err() {
+                        break; // timed out and replaced: nobody is waiting
+                    }
+                }
+            })?;
+        Ok(Runner { jobs, results })
+    }
+}
+
+thread_local! {
+    static RUNNER: RefCell<Option<Runner>> = const { RefCell::new(None) };
+}
+
+/// Scripts that exceeded the time limit; they fail fast here until the node restarts or the
+/// script changes. Each one leaked at most one stuck runner thread, which bounds the leak.
+static DISABLED: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(Default::default);
+
 pub fn run(source: &str, input: &Input) -> Outcome {
-    ENGINE.with(|cell| {
+    if DISABLED.read().unwrap().contains(source) {
+        return Outcome::Error("disabled on this node after exceeding the time limit".into());
+    }
+    RUNNER.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            match Engine::new() {
-                Ok(e) => *slot = Some(e),
-                Err(e) => return Outcome::Error(format!("starting Lua: {e}")),
+            match Runner::spawn() {
+                Ok(r) => *slot = Some(r),
+                Err(e) => return Outcome::Error(format!("starting a script thread: {e}")),
             }
         }
-        let engine = slot.as_mut().unwrap();
-        match engine.call(source, input) {
+        let runner = slot.as_ref().unwrap();
+        if runner
+            .jobs
+            .send((source.to_string(), input.clone()))
+            .is_err()
+        {
+            *slot = None; // the runner died (a panic); the next call gets a fresh one
+            return Outcome::Error("script thread exited".into());
+        }
+        match runner.results.recv_timeout(TIME_LIMIT) {
             Ok(outcome) => outcome,
-            Err(e) => Outcome::Error(e.to_string()),
+            Err(RecvTimeoutError::Timeout) => {
+                // Abandon the stuck runner (it exits if the call ever returns) and disable the
+                // script so it can't strand another one.
+                *slot = None;
+                DISABLED.write().unwrap().insert(source.to_string());
+                crate::metrics::inc(&crate::metrics::LUA_TIMEOUTS);
+                Outcome::Error(format!(
+                    "exceeded the {}ms time limit; disabled on this node",
+                    TIME_LIMIT.as_millis()
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                *slot = None;
+                Outcome::Error("script thread exited".into())
+            }
         }
     })
 }
@@ -231,12 +305,12 @@ impl Engine {
         let (f, env) = &self.scripts[source];
 
         let q = self.lua.create_table()?;
-        q.set("name", input.qname)?;
-        q.set("type", input.qtype)?;
+        q.set("name", input.qname.as_str())?;
+        q.set("type", input.qtype.as_str())?;
         q.set("client", input.client.to_string())?;
         q.set("client_prefix", input.client_prefix)?;
         q.set("source", input.source.to_string())?;
-        q.set("node", input.node)?;
+        q.set("node", input.node.as_str())?;
         q.set("static", input.statics.clone())?;
         env.set("q", q)?;
 
@@ -294,16 +368,31 @@ fn in_cidr(ip: &str, cidr: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn input() -> Input<'static> {
+    fn input() -> Input {
         Input {
-            qname: "www.example.com.",
-            qtype: "A",
+            qname: "www.example.com.".into(),
+            qtype: "A".into(),
             client: "10.1.2.0".parse().unwrap(),
             client_prefix: 24,
             source: "192.0.2.53".parse().unwrap(),
-            node: "node1",
+            node: "node1".into(),
             statics: vec!["198.51.100.1".into()],
         }
+    }
+
+    #[test]
+    fn time_limit_disables_scripts_stuck_in_c() {
+        let i = input();
+        // Backtracking pattern matching runs in C, where the instruction budget never fires.
+        let stuck = "local s = ('a'):rep(60000) return s:find('.-.-.-.-.-.-b')";
+        let t = std::time::Instant::now();
+        assert!(matches!(run(stuck, &i), Outcome::Error(e) if e.contains("time limit")));
+        assert!(t.elapsed() < TIME_LIMIT * 5, "took {:?}", t.elapsed());
+        // Disabled from now on, without running; other scripts still run on a fresh runner.
+        let t = std::time::Instant::now();
+        assert!(matches!(run(stuck, &i), Outcome::Error(e) if e.contains("disabled")));
+        assert!(t.elapsed() < TIME_LIMIT);
+        assert_eq!(run("return 'ok'", &i), Outcome::Answer(vec!["ok".into()]));
     }
 
     #[test]

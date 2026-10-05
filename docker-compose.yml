@@ -64,6 +64,7 @@ services:
       - "127.0.0.1:9301:9153"
     environment:
       CONTROL_PLANE_TOKEN: *nodes-token
+      CONTROL_PLANE_ALLOW_HTTP: "1" # plain HTTP on the private compose network only
     depends_on: [control-plane]
 
   node2:

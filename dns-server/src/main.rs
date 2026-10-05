@@ -310,6 +310,36 @@ const USAGE: &str = "usage:
   --cookie-secret HEX   32 hex digits; share it across anycast nodes (default: random)
   --map-size-mb N       LMDB map size; writes fail once the data outgrows it (default 1024)";
 
+/// Whether `url` is safe to send the token and changelog to: `https://`, or plain `http://`
+/// only to a loopback host unless `allow_http` (CONTROL_PLANE_ALLOW_HTTP=1, for trusted
+/// networks such as the compose setup). Tokens and LUA scripts must not cross a network in
+/// the clear.
+// ponytail: the same check lives in mcp-server/src/main.rs; share a crate if a third client appears.
+fn check_transport(url: &str, allow_http: bool) -> Result<(), String> {
+    let uri: ureq::http::Uri = url
+        .parse()
+        .map_err(|e| format!("invalid control plane URL {url:?}: {e}"))?;
+    let host = uri.host().unwrap_or("");
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match uri.scheme_str() {
+        Some("https") => Ok(()),
+        Some("http") if loopback || allow_http => Ok(()),
+        Some("http") => Err(format!(
+            "refusing plain http:// to {host}: use https:// (TLS), or set CONTROL_PLANE_ALLOW_HTTP=1 on a trusted network"
+        )),
+        _ => Err(format!("control plane URL {url:?} must start with https://")),
+    }
+}
+
+fn allow_http() -> bool {
+    std::env::var("CONTROL_PLANE_ALLOW_HTTP").is_ok_and(|v| v == "1")
+}
+
 fn usage() -> ! {
     eprintln!("{USAGE}");
     std::process::exit(2);
@@ -360,6 +390,12 @@ async fn main() -> store::Result<()> {
                     None => Cookies::random()?,
                 },
             });
+            if let Some(url) = &follow {
+                if let Err(e) = check_transport(url, allow_http()) {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
             if let Some(url) = follow {
                 println!("following {url}");
                 let store = srv.store.clone();
@@ -468,6 +504,27 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn transport() {
+        for ok in [
+            "https://cp.example.net",
+            "http://127.0.0.1:8053",
+            "http://localhost:8053",
+            "http://[::1]:8053",
+        ] {
+            assert!(check_transport(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://cp.example.net",
+            "http://192.0.2.1:8053",
+            "ftp://127.0.0.1",
+            "nonsense",
+        ] {
+            assert!(check_transport(bad, false).is_err(), "{bad}");
+        }
+        assert!(check_transport("http://control-plane:8053", true).is_ok());
     }
 
     #[test]

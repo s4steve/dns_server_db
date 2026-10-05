@@ -234,15 +234,13 @@ fn tailor(
     client: &Client,
     statics: &[Record],
 ) -> std::result::Result<Option<Vec<Record>>, String> {
-    let qname_text = qname.to_lowercase().to_string();
-    let qtype_text = qtype.to_string();
     let input = script::Input {
-        qname: &qname_text,
-        qtype: &qtype_text,
+        qname: qname.to_lowercase().to_string(),
+        qtype: qtype.to_string(),
         client: client.addr,
         client_prefix: client.prefix,
         source: client.source,
-        node: client.node,
+        node: client.node.to_string(),
         statics: statics.iter().map(|r| r.data.to_string()).collect(),
     };
     crate::metrics::inc(&crate::metrics::LUA_RUNS);
