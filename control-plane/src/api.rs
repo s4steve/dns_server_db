@@ -898,9 +898,11 @@ async fn get_spf(
     .fetch_optional(&pool)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("no SPF policy at {name}")))?;
+    // Stored terms always rendered once, so this can't fail; it's what an include costs.
+    let records = spf::render(&name, &terms, &qualifier).map_or(0, |r| r.len());
     Ok(Json(json!({
         "name": name.to_string(), "senders": senders, "qualifier": qualifier, "terms": terms,
-        "last_error": last_error, "updated_at": updated_at,
+        "records": records, "last_error": last_error, "updated_at": updated_at,
     })))
 }
 
