@@ -9,7 +9,7 @@ See [PLAN.md](PLAN.md) for the full design, decisions, and staged roadmap.
 **All planned stages are done (Stage 5, ALIAS, was skipped and can be added later).** The last one, Stage 7, added an MCP server so AI assistants can manage zones through the same validated API. See [MCP server](#mcp-server).
 
 Already in place:
-- **Managed SPF:** flattens a domain's allowed senders into TXT records that stay under SPF's 10-lookup limit. See [Managed SPF](#managed-spf).
+- **Managed SPF:** flattens a domain's allowed senders into TXT records that stay under SPF's 10-lookup limit. See [Managed SPF](#managed-spf). The [DMARC app](https://github.com/s4steve/dmarc_app) uses it to manage its customers' senders; see [Connecting the DMARC app](#connecting-the-dmarc-app).
 - **Operations (Stage 6):** Prometheus metrics, a health check for anycast, response rate limiting, DNS cookies, and a load test. See [Operations](#operations).
 - **LuaJIT tailoring (Stage 4):** `LUA` records hold scripts that build answers per query. See [LUA records](#lua-records).
 - **Replication (Stage 3):** DNS nodes follow the control plane's changelog, and a change reaches every node in about a second.
@@ -120,26 +120,77 @@ _spf1.N    TXT "v=spf1 …"
 - **Permissions:** writing a policy needs editor on the zone; reading one needs viewer.
 - **No per-message answers:** every receiver gets the same answer, and queries carry nothing about the sender. Answering SPF macro queries per sender was considered and left out, because it appears to be covered by Valimail's US patents (e.g. US 9,762,618 and its continuations, expiring around 2036).
 
-### Managed SPF for another app
+### Connecting the DMARC app
 
-An app (such as a DMARC dashboard) can publish policies for its own customers in one shared zone. Each customer then adds a single `include:` to their real SPF record, and the app needs no access to the customer's DNS.
+[dmarc_app](https://github.com/s4steve/dmarc_app) uses managed SPF so its customers can pick their email senders in the app instead of maintaining SPF records by hand. The app publishes one policy per customer domain in a shared zone that you host here. Each customer then adds a single `include:` to their own SPF record. The app never needs access to the customers' DNS.
 
-1. Create the zone and delegate it at the registrar to the DNS nodes:
+```
+customer's DNS:  example.com.                         TXT "v=spf1 include:example-com-3f9a1c.spf.example.net ~all"
+this server:     example-com-3f9a1c.spf.example.net.  TXT "v=spf1 ip4:… ip6:… include:_spf0.example-com-3f9a1c.spf.example.net ~all"
+                 _spf0.example-com-3f9a1c.spf.example.net.  TXT "v=spf1 ip4:… ip6:…"   (only when the root is full)
+```
+
+The app calls `PUT /zones/spf.example.net/spf/<name>` with the customer's senders. The control plane flattens them, publishes the records, and re-resolves them every `SPF_REFRESH_SECS`. The DNS nodes serve them like any other record.
+
+- **Names:** the app chooses each policy name, and makes it unguessable (`<domain-slug>-<random>`). It doesn't verify domain ownership, so a name derived from the domain alone would let one customer set the senders another customer's SPF includes.
+- **Lookup cost:** a customer's `include:` costs one lookup per record (the root plus any chunks). `PUT` and `GET` return that count as `records`, and the app shows it.
+
+#### Production setup
+
+1. **Create the shared zone** with an admin token:
 
    ```bash
    curl -X POST -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
-     https://cp.example.net/zones -d '{"name": "spf.example.net.", "ns": ["ns1.example.net.", "ns2.example.net."]}'
+     https://cp.example.net/zones \
+     -d '{"name": "spf.example.net.", "ns": ["ns1.example.net.", "ns2.example.net."]}'
    ```
 
-2. Give the app a token that is editor on that zone only, never admin:
+2. **Delegate it.** In the parent zone (`example.net`, wherever it's hosted), add NS records for `spf.example.net` that point at your DNS nodes. Check that the delegation works:
 
    ```bash
-   control-plane create-token --name dmarc-app --grant spf.example.net.:editor
+   dig +short NS spf.example.net
+   dig @ns1.example.net SOA spf.example.net
    ```
 
-3. The app `PUT`s each customer's policy at a name it chooses, e.g. `acme-3f9a1c.spf.example.net`. Use unguessable names if the app doesn't verify domain ownership, so one customer can't set the senders another customer's SPF includes.
+3. **Mint the app's token with the CLI**, as editor on that zone only, never admin. Use the CLI rather than `POST /tokens`: API-minted tokens expire (365 days at most), and the app's writes would then start failing.
 
-A customer's `include:` costs one lookup per record: the root plus any chunks. `PUT` and `GET` return that count as `records`.
+   ```bash
+   DATABASE_URL=postgres://… control-plane create-token --name dmarc-app --grant spf.example.net.:editor
+   ```
+
+   The secret is printed once. To rotate it, mint a token under a new name (names stay taken after revocation), switch the app to it, then revoke the old one with `DELETE /tokens/dmarc-app`.
+
+4. **Serve the control plane over TLS** (see [Control plane](#control-plane)). The DMARC app refuses to send its token over plain `http` to anything but loopback.
+
+5. **Configure the DMARC app** with `DNS_CONTROL_PLANE_URL`, `DNS_CONTROL_PLANE_TOKEN` and `SPF_ZONE=spf.example.net.`. See its README's "Managed SPF" section.
+
+#### Local development
+
+Run both projects on one machine with this repo's multinode stack:
+
+```bash
+docker compose --profile multinode up -d
+ADMIN=dnsdb_dev_admin_token_do_not_use_in_production   # fixed dev-only token from docker-compose.yml
+
+curl -X POST -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  http://127.0.0.1:8054/zones -d '{"name": "spf.test.", "ns": ["ns1.spf.test."]}'
+curl -X POST -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  http://127.0.0.1:8054/tokens \
+  -d '{"name": "dmarc-app-dev", "grants": [{"pattern": "spf.test.", "role": "editor"}]}'
+```
+
+Give the DMARC app the `token` from the second response, with `SPF_ZONE=spf.test.` and:
+
+- `DNS_CONTROL_PLANE_URL=http://127.0.0.1:8054` if its backend runs directly on the host; or
+- `DNS_CONTROL_PLANE_URL=http://host.docker.internal:8054` with `DNS_CONTROL_PLANE_ALLOW_HTTP=1` if it runs in Docker Desktop.
+
+After publishing a policy in the app, query a node for it:
+
+```bash
+dig @127.0.0.1 -p 5301 TXT <name>.spf.test
+```
+
+Nothing on the internet delegates `spf.test`, so the app will always report the include as not installed in a customer's SPF record. That is expected locally.
 
 ## MCP server
 
