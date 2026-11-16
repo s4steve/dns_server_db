@@ -177,6 +177,43 @@ fn strength_bits(secret: &str) -> f64 {
     secret.chars().count() as f64 * (distinct as f64).log2()
 }
 
+/// A supplied secret must look like encoded random bytes: hex or base64 of 32 bytes or more
+/// (43+ characters), strong by the estimate above, with no run of counting or repeating
+/// characters. Generate one with `openssl rand -hex 32`.
+// ponytail: this refuses obvious patterns; it can't prove a value is random.
+fn check_supplied(secret: &str) -> Result<(), String> {
+    let body = secret.trim_end_matches('=').as_bytes();
+    let encoded = body
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || b"+/-_".contains(c));
+    let patterned = body.windows(6).any(|w| {
+        let step = w[1] as i16 - w[0] as i16;
+        (-1..=1).contains(&step) && w.windows(2).all(|p| p[1] as i16 - p[0] as i16 == step)
+    });
+    if body.len() < 43 || !encoded || patterned || strength_bits(secret) < 128.0 {
+        return Err(
+            "a supplied secret must be hex or base64 of at least 32 random bytes (43+ \
+             characters), without counting or repeating runs; generate one with \
+             `openssl rand -hex 32`"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Requests refused with 401 (`control_plane_auth_failures_total`).
+pub static AUTH_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unauthorized(message: &str) -> ApiError {
+    AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ApiError::Unauthorized(message.into())
+}
+
+/// Longest life a token may be given, in days.
+pub const TOKEN_DAYS_MAX: u32 = 365;
+/// Life of a token that must expire but wasn't given one: API-minted and admin tokens.
+pub const TOKEN_DAYS_DEFAULT: u32 = 90;
+
 fn hash(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
 }
@@ -199,11 +236,7 @@ impl FromRequestParts<PgPool> for Caller {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::trim)
-            .ok_or_else(|| {
-                ApiError::Unauthorized(
-                    "missing bearer token (Authorization: Bearer <token>)".into(),
-                )
-            })?;
+            .ok_or_else(|| unauthorized("missing bearer token (Authorization: Bearer <token>)"))?;
         let token: TokenRow = sqlx::query_as(
             "SELECT id, name, admin, expires_at::text FROM tokens
              WHERE hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
@@ -211,7 +244,7 @@ impl FromRequestParts<PgPool> for Caller {
         .bind(hash(secret))
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| ApiError::Unauthorized("invalid, expired or revoked token".into()))?;
+        .ok_or_else(|| unauthorized("invalid, expired or revoked token"))?;
         let grants = load_grants(pool, token.id).await?;
         // At most one write a minute per token, however often it polls.
         sqlx::query(
@@ -270,15 +303,22 @@ pub async fn create_token(
             "token name {name:?} must be 1-64 characters of letters, digits, '.', '_' or '-'"
         )]));
     }
+    // Admin tokens always expire; others only when asked (DNS nodes' tokens don't, because
+    // an expired node token takes every zone down once its SOA EXPIRE passes).
+    let expires_in_days = expires_in_days.or(admin.then_some(TOKEN_DAYS_DEFAULT));
+    if expires_in_days.is_some_and(|d| !(1..=TOKEN_DAYS_MAX).contains(&d)) {
+        return Err(ApiError::BadRequest(vec![format!(
+            "a token's life must be between 1 and {TOKEN_DAYS_MAX} days"
+        )]));
+    }
+    // The stored prefix is for recognizing a token. A generated secret's is `dnsdb_` plus 6
+    // random characters; a supplied one shows less, since nothing says how strong it is.
+    let prefix_len = if secret.is_some() { 6 } else { 12 };
     let secret = match secret {
-        Some(s) if s.len() < 32 || strength_bits(s) < 128.0 => {
-            return Err(ApiError::BadRequest(vec![
-                "a supplied secret must be at least 32 characters and about 128 bits strong \
-                 (length × log2 of its distinct characters); generate one with `openssl rand -hex 32`"
-                    .into(),
-            ]));
+        Some(s) => {
+            check_supplied(s).map_err(|e| ApiError::BadRequest(vec![e]))?;
+            s.to_string()
         }
-        Some(s) => s.to_string(),
         None => {
             let mut bytes = [0u8; 32];
             getrandom::fill(&mut bytes).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -297,7 +337,7 @@ pub async fn create_token(
     )
     .bind(name)
     .bind(hash(&secret))
-    .bind(secret.chars().take(12).collect::<String>())
+    .bind(secret.chars().take(prefix_len).collect::<String>())
     .bind(admin)
     .bind(expires_in_days.map(|d| d as i32))
     .fetch_optional(&mut *tx)
@@ -310,12 +350,33 @@ pub async fn create_token(
             _ => e.into(),
         },
     )?;
-    let Some(id) = id else {
-        return if if_missing {
-            Ok(None)
-        } else {
-            Err(ApiError::Conflict(format!("token {name:?} already exists")))
-        };
+    let id = match id {
+        Some(id) => id,
+        None if !if_missing => {
+            return Err(ApiError::Conflict(format!("token {name:?} already exists")));
+        }
+        None => {
+            // --if-missing keeps a working token, but renews one that has expired (not one
+            // that was revoked), so re-running a bootstrap repairs it.
+            let renewed: Option<i64> = sqlx::query_scalar(
+                "UPDATE tokens SET hash = $2, prefix = $3, admin = $4, created_at = now(),
+                        last_used_at = NULL, expires_at = now() + make_interval(days => $5)
+                 WHERE name = $1 AND revoked_at IS NULL AND expires_at <= now() RETURNING id",
+            )
+            .bind(name)
+            .bind(hash(&secret))
+            .bind(secret.chars().take(prefix_len).collect::<String>())
+            .bind(admin)
+            .bind(expires_in_days.map(|d| d as i32))
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(id) = renewed else { return Ok(None) };
+            sqlx::query("DELETE FROM grants WHERE token_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            id
+        }
     };
     for g in grants {
         sqlx::query(
@@ -411,9 +472,22 @@ mod tests {
         assert_ne!(hash("abc"), hash("abd"));
 
         // Supplied secrets: repetitive ones are too weak, random or varied ones pass.
-        assert!(strength_bits(&"a".repeat(64)) < 128.0);
-        assert!(strength_bits(&"ab".repeat(32)) < 128.0);
-        assert!(strength_bits("0123456789abcdef0123456789abcdef") >= 128.0);
-        assert!(strength_bits("dnsdb_dev_nodes_token_do_not_use_in_production") >= 128.0);
+        for weak in [
+            "a".repeat(64),
+            "ab".repeat(32),
+            "0123456789abcdef".repeat(4), // counting runs
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".into(),
+            "3f9a1c0e7b2d4a6f8c1e3b5d7f9a2c4e".into(), // 32 characters: too short
+            "correct horse battery staple correct horse battery".into(), // not hex or base64
+        ] {
+            assert!(check_supplied(&weak).is_err(), "{weak}");
+        }
+        for ok in [
+            "3f9a1c0e7b2d4a6f8c1e3b5d7f9a2c4e6b8d0f1a3c5e7092b4d6f8a1c3e5079b", // hex, 32 bytes
+            "kJ8vQ2xLm9ZtRw4YbN7cHs1PfUe6GiVo3DaXyT0qBzM=",                     // base64, 32 bytes
+            "dnsdb_dev_nodes_token_do_not_use_in_production",                   // compose dev token
+        ] {
+            assert!(check_supplied(ok).is_ok(), "{ok}");
+        }
     }
 }

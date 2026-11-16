@@ -4,14 +4,18 @@ use tokio::net::TcpListener;
 const USAGE: &str = "usage:
   control-plane                serve the API (DATABASE_URL required; LISTEN, SPF_REFRESH_SECS=900)
   control-plane create-token --name NAME [--admin] [--grant PATTERN:ROLE[:scripts]]...
-                             [--secret-env VAR | --secret VALUE] [--if-missing]
+                             [--expires-in-days N] [--secret-env VAR | --secret VALUE]
+                             [--if-missing]
 
   create-token prints the new token's secret. Use it to mint the first admin token.
   --grant      e.g. 'example.com:editor', '*.team.test:owner:scripts', '*:viewer' (DNS nodes)
+  --expires-in-days  1-365. Admin tokens always expire (default 90); other tokens made here
+               don't unless this is given (DNS nodes' tokens shouldn't)
   --secret-env register the value of environment variable VAR instead of a random one
                (automation; 32+ characters)
   --secret     the same, given directly; it shows up in ps and shell history, so prefer --secret-env
-  --if-missing leave an existing token with this name alone (prints nothing)";
+  --if-missing leave a working token with this name alone (prints nothing); renew it if it
+               has expired";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -55,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("create-token") => {
             let (mut name, mut admin, mut grants, mut secret, mut if_missing) =
                 (None, false, vec![], None, false);
+            let mut days = None;
             let mut rest = args[1..].iter();
             while let Some(flag) = rest.next() {
                 let mut value = || rest.next().cloned().unwrap_or_else(|| usage());
@@ -74,6 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     "--if-missing" => if_missing = true,
+                    "--expires-in-days" => {
+                        days = Some(value().parse::<u32>().unwrap_or_else(|_| usage()))
+                    }
                     _ => usage(),
                 }
             }
@@ -84,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 admin,
                 &grants,
                 secret.as_deref(),
-                None,
+                days,
                 if_missing,
             )
             .await

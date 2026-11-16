@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, so new advisories show up without a push
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dns
+          POSTGRES_PASSWORD: dns
+          POSTGRES_DB: dns
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dns" --health-interval 2s --health-retries 15
+    env:
+      DATABASE_URL: postgres://dns:dns@127.0.0.1:5432/dns
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
+      - run: cargo fmt --all --check
+      # Not -D warnings yet: the tree has some long-standing clippy style warnings.
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

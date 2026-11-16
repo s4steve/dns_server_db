@@ -74,6 +74,7 @@ pub fn router(pool: PgPool) -> Router {
         )
         .route("/changelog", get(changelog))
         .route("/whoami", get(whoami))
+        .route("/metrics", get(metrics))
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{name}", axum::routing::delete(revoke_token))
         .layer(middleware::from_fn(limits))
@@ -1031,63 +1032,86 @@ pub async fn refresh_spf(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .fetch_all(pool)
     .await?;
-    for (zone, name, senders, qualifier) in policies {
-        let (Ok(zone), Ok(name)) = (validate::parse_zone(&zone), validate::parse_zone(&name))
-        else {
-            continue;
-        };
-        let result = match spf::flatten_live(&senders).await {
-            Ok(terms) => spf::render(&name, &terms, &qualifier).map(|d| (terms, d)),
-            Err(e) => Err(e),
-        };
-        let mut tx = pool.begin().await?;
-        // Skip a policy deleted or replaced while we were resolving.
-        let current: Option<i64> = sqlx::query_scalar(
-            "SELECT p.zone_id FROM spf_policies p JOIN zones z ON z.id = p.zone_id
-             WHERE z.name = $1 AND p.name = $2 AND p.senders = $3 AND p.qualifier = $4
-             FOR UPDATE OF p",
-        )
-        .bind(zone.to_string())
-        .bind(name.to_string())
-        .bind(&senders)
-        .bind(&qualifier)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(zone_id) = current else { continue };
-        let error = match result {
-            Ok((terms, desired)) => {
-                match sync_spf_records(&mut tx, &zone, &name, &desired, "spf-refresh").await {
-                    Ok(_) => {
-                        sqlx::query(
-                            "UPDATE spf_policies SET terms = $3, last_error = NULL, updated_at = now()
-                             WHERE zone_id = $1 AND name = $2",
-                        )
-                        .bind(zone_id)
-                        .bind(name.to_string())
-                        .bind(&terms)
-                        .execute(&mut *tx)
-                        .await?;
-                        tx.commit().await?;
-                        continue;
-                    }
-                    Err(e) => {
-                        tx.rollback().await?;
-                        tx = pool.begin().await?;
-                        format!("{e:?}")
-                    }
+    // A few at a time: one policy with slow senders (up to 20 s) no longer holds up the rest.
+    for batch in policies.chunks(MAX_SPF_RESOLVING) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (zone, name, senders, qualifier) in batch.iter().cloned() {
+            let pool = pool.clone();
+            tasks.spawn(async move { refresh_one(&pool, zone, name, senders, qualifier).await });
+        }
+        while let Some(done) = tasks.join_next().await {
+            match done {
+                Ok(result) => result?,
+                Err(e) => eprintln!("spf refresh task: {e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_one(
+    pool: &PgPool,
+    zone: String,
+    name: String,
+    senders: Vec<String>,
+    qualifier: String,
+) -> Result<(), sqlx::Error> {
+    let (Ok(zone), Ok(name)) = (validate::parse_zone(&zone), validate::parse_zone(&name)) else {
+        return Ok(());
+    };
+    let result = match spf::flatten_live(&senders).await {
+        Ok(terms) => spf::render(&name, &terms, &qualifier).map(|d| (terms, d)),
+        Err(e) => Err(e),
+    };
+    let mut tx = pool.begin().await?;
+    // Skip a policy deleted or replaced while we were resolving.
+    let current: Option<i64> = sqlx::query_scalar(
+        "SELECT p.zone_id FROM spf_policies p JOIN zones z ON z.id = p.zone_id
+         WHERE z.name = $1 AND p.name = $2 AND p.senders = $3 AND p.qualifier = $4
+         FOR UPDATE OF p",
+    )
+    .bind(zone.to_string())
+    .bind(name.to_string())
+    .bind(&senders)
+    .bind(&qualifier)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(zone_id) = current else {
+        return Ok(());
+    };
+    let error = match result {
+        Ok((terms, desired)) => {
+            match sync_spf_records(&mut tx, &zone, &name, &desired, "spf-refresh").await {
+                Ok(_) => {
+                    sqlx::query(
+                        "UPDATE spf_policies SET terms = $3, last_error = NULL, updated_at = now()
+                         WHERE zone_id = $1 AND name = $2",
+                    )
+                    .bind(zone_id)
+                    .bind(name.to_string())
+                    .bind(&terms)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tx.rollback().await?;
+                    tx = pool.begin().await?;
+                    format!("{e:?}")
                 }
             }
-            Err(e) => e,
-        };
-        eprintln!("spf refresh of {name}: {error}");
-        sqlx::query("UPDATE spf_policies SET last_error = $3 WHERE zone_id = $1 AND name = $2")
-            .bind(zone_id)
-            .bind(name.to_string())
-            .bind(&error)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-    }
+        }
+        Err(e) => e,
+    };
+    eprintln!("spf refresh of {name}: {error}");
+    sqlx::query("UPDATE spf_policies SET last_error = $3 WHERE zone_id = $1 AND name = $2")
+        .bind(zone_id)
+        .bind(name.to_string())
+        .bind(&error)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1143,6 +1167,19 @@ async fn changelog(
 
 // ---------- tokens ----------
 
+/// Prometheus metrics, for any valid token (give the scraper a token with no grants).
+async fn metrics(_caller: Caller) -> impl IntoResponse {
+    let failures = auth::AUTH_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        format!(
+            "# HELP control_plane_auth_failures_total Requests refused with 401: missing, invalid, expired or revoked token.\n\
+             # TYPE control_plane_auth_failures_total counter\n\
+             control_plane_auth_failures_total {failures}\n"
+        ),
+    )
+}
+
 async fn whoami(caller: Caller) -> Json<Value> {
     Json(json!({
         "name": caller.name, "admin": caller.admin, "grants": caller.grants,
@@ -1153,8 +1190,7 @@ async fn whoami(caller: Caller) -> Json<Value> {
 /// Tokens minted through the API (for people and MCP clients) always expire. Expiry limits
 /// how long a leaked token stays useful; brute force isn't the concern, since generated
 /// secrets are 256 random bits. CLI-minted tokens (e.g. the nodes') are exempt.
-const TOKEN_DAYS_DEFAULT: u32 = 90;
-const TOKEN_DAYS_MAX: u32 = 365;
+use auth::{TOKEN_DAYS_DEFAULT, TOKEN_DAYS_MAX};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

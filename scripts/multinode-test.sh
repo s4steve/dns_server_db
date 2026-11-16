@@ -137,6 +137,7 @@ cookie=$(cookie_query 5301 "www.$ZONE" 0102030405060708)
 [[ ${#cookie} == 48 ]] || fail "no server cookie from node1 (got '$cookie')"
 before=$(valid_cookies 9302)
 cookie_query 5302 "www.$ZONE" "$cookie" >/dev/null
+sleep 1.1 # /metrics responses are reused for a second
 after=$(valid_cookies 9302)
 (( after == before + 1 )) || fail "node2 didn't accept node1's cookie ($before -> $after)"
 echo "   node1's server cookie is accepted by node2"

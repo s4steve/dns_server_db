@@ -234,6 +234,13 @@ fn cidr(s: &str) -> Result<String, String> {
             .ok_or_else(|| format!("invalid prefix length in {s:?}"))?,
         None => max,
     };
+    // A shorter prefix authorizes a large share of the internet, which no real sender needs.
+    let min = if ip.is_ipv4() { 8 } else { 16 };
+    if len < min {
+        return Err(format!(
+            "{s:?} is wider than /{min}, which would authorize far too many senders"
+        ));
+    }
     Ok(if len == max {
         format!("{kind}:{ip}")
     } else {
@@ -480,6 +487,10 @@ mod tests {
                 .unwrap_err()
                 .contains("prefix")
         );
+        for wide in ["0.0.0.0/0", "ip4:10.0.0.0/7", "ip6:2000::/3"] {
+            assert!(run(&r, &[wide]).unwrap_err().contains("wider"), "{wide}");
+        }
+        assert!(run(&r, &["10.0.0.0/8", "2001:db8::/16"]).is_ok());
     }
 
     #[test]

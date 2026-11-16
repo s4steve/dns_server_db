@@ -599,7 +599,141 @@ async fn permissions() {
     .await
     .unwrap();
     assert!(about_90_days);
-    assert!(call(&admin, "GET", "/whoami", None).await.1["expires_at"].is_null());
+    // CLI-minted tokens: admins always expire, others (like the nodes') don't unless asked.
+    assert!(call(&admin, "GET", "/whoami", None).await.1["expires_at"].is_string());
+    assert!(call(&viewer, "GET", "/whoami", None).await.1["expires_at"].is_null());
+
+    // --if-missing: a working token is left alone; an expired one is renewed with the new
+    // secret and grants; a revoked one stays dead.
+    use control_plane::auth::{Grant, create_token};
+    let renew = unique("renew-");
+    let grant = |role: &str| vec![Grant::parse_cli(&format!("{zone}:{role}")).unwrap()];
+    let first = create_token(
+        &admin.pool,
+        &renew,
+        false,
+        &grant("viewer"),
+        None,
+        Some(30),
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let again = create_token(
+        &admin.pool,
+        &renew,
+        false,
+        &grant("editor"),
+        None,
+        Some(30),
+        true,
+    )
+    .await;
+    assert!(again.unwrap().is_none());
+    sqlx::query("UPDATE tokens SET expires_at = now() - interval '1 second' WHERE name = $1")
+        .bind(&renew)
+        .execute(&admin.pool)
+        .await
+        .unwrap();
+    let failures_before =
+        control_plane::auth::AUTH_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        call(&admin.as_token(&first), "GET", "/whoami", None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let second = create_token(
+        &admin.pool,
+        &renew,
+        false,
+        &grant("editor"),
+        None,
+        Some(30),
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(first, second);
+    let (status, me) = call(&admin.as_token(&second), "GET", "/whoami", None).await;
+    assert_eq!(
+        (status, &me["grants"][0]["role"]),
+        (StatusCode::OK, &json!("editor"))
+    );
+    assert_eq!(
+        call(&admin.as_token(&first), "GET", "/whoami", None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    sqlx::query("UPDATE tokens SET revoked_at = now(), expires_at = now() WHERE name = $1")
+        .bind(&renew)
+        .execute(&admin.pool)
+        .await
+        .unwrap();
+    let revoked = create_token(
+        &admin.pool,
+        &renew,
+        false,
+        &grant("editor"),
+        None,
+        Some(30),
+        true,
+    )
+    .await;
+    assert!(revoked.unwrap().is_none());
+
+    // Refused requests are counted, and the count is served to any valid token.
+    let resp = admin
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", format!("Bearer {}", viewer.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let count: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("control_plane_auth_failures_total "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(count >= failures_before + 2, "{text}");
+    assert_eq!(
+        call(&admin.as_token(""), "GET", "/metrics", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A token's life is capped whichever way it's minted.
+    let too_long = create_token(
+        &admin.pool,
+        &unique("long-"),
+        false,
+        &[],
+        None,
+        Some(366),
+        false,
+    )
+    .await;
+    assert!(matches!(
+        too_long,
+        Err(control_plane::api::ApiError::BadRequest(_))
+    ));
     for days in [0, 366] {
         let (status, body) = call(
             &admin,

@@ -234,22 +234,57 @@ pub fn render(store: &Store) -> String {
     out
 }
 
+/// Both endpoints walk every zone, so each response is reused for CACHE_FOR: requests from
+/// anyone who can reach `--http` cost one walk a second at most.
+const CACHE_FOR: Duration = Duration::from_secs(1);
+
+type Cached<T> = std::sync::Mutex<Option<(std::time::Instant, T)>>;
+
+struct Http {
+    store: Arc<Store>,
+    metrics: Cached<String>,
+    health: Cached<(StatusCode, serde_json::Value)>,
+}
+
+fn cached<T: Clone>(slot: &Cached<T>, make: impl FnOnce() -> T) -> T {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*slot {
+        Some((at, value)) if at.elapsed() < CACHE_FOR => value.clone(),
+        _ => {
+            let value = make();
+            *slot = Some((std::time::Instant::now(), value.clone()));
+            value
+        }
+    }
+}
+
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
-        .with_state(store)
+        .with_state(Arc::new(Http {
+            store,
+            metrics: Default::default(),
+            health: Default::default(),
+        }))
 }
 
-async fn metrics_handler(State(store): State<Arc<Store>>) -> impl IntoResponse {
+async fn metrics_handler(State(http): State<Arc<Http>>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        render(&store),
+        cached(&http.metrics, || render(&http.store)),
     )
 }
 
-async fn health_handler(State(store): State<Arc<Store>>) -> impl IntoResponse {
-    match health(&store) {
+async fn health_handler(State(http): State<Arc<Http>>) -> impl IntoResponse {
+    let (status, body) = cached(&http.health, || health_response(&http.store));
+    (status, axum::Json(body))
+}
+
+fn health_response(store: &Store) -> (StatusCode, serde_json::Value) {
+    match health(store) {
         Ok(h) => {
             let status = if h.healthy {
                 StatusCode::OK
@@ -260,11 +295,11 @@ async fn health_handler(State(store): State<Arc<Store>>) -> impl IntoResponse {
                 "healthy": h.healthy, "zones": h.zones, "expired": h.expired,
                 "applied_seq": h.applied_seq, "last_sync_age_seconds": h.last_sync_age,
             });
-            (status, axum::Json(body))
+            (status, body)
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "healthy": false, "error": e.to_string() })),
+            serde_json::json!({ "healthy": false, "error": e.to_string() }),
         ),
     }
 }

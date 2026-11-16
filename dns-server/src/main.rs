@@ -490,6 +490,11 @@ async fn main() -> store::Result<()> {
             if let Some(addr) = http {
                 let listener = TcpListener::bind(&addr).await?;
                 println!("metrics and health on http://{addr}");
+                if !listener.local_addr()?.ip().is_loopback() {
+                    eprintln!(
+                        "warning: --http {addr} is not loopback, and /metrics and /health need no login: keep it off the public internet"
+                    );
+                }
                 let app = metrics::router(srv.store.clone());
                 tokio::spawn(async move { axum::serve(listener, app).await });
             }

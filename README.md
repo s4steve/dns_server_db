@@ -114,7 +114,9 @@ _spf1.N    TXT "v=spf1 …"
 - **Qualifier** is `~all` (the default), `-all` or `?all`.
 - **Lookups:** the root and each chunk are at most 450 bytes, and there are at most 9 chunks, so receivers use 9 lookups or fewer. A policy that fits in the root uses none.
 - **Other TXT records** at `N` are kept. `N`'s own `v=spf1` record and the `_spf0`–`_spf8` names are managed, so hand edits to them get overwritten.
-- **Refresh:** every `SPF_REFRESH_SECS` (default 900), the control plane re-resolves every policy and commits only when the records change (actor `spf-refresh`).
+- **Refresh:** every `SPF_REFRESH_SECS` (default 900), the control plane re-resolves every policy, four at a time, and commits only when the records change (actor `spf-refresh`).
+- **Wide ranges:** a range wider than /8 (IPv4) or /16 (IPv6) is refused, whether you list it or a sender's record does.
+- **Resolver:** flattening trusts the control plane's DNS resolver. Point it at a DNSSEC-validating one, so forged answers can't add senders.
 - **Failures:** if a refresh fails, the last good records stay and the policy's `last_error` is set. A `PUT` that can't be flattened is rejected and stores nothing.
 - **What can't be flattened:** senders whose records use `exists:`, `ptr` or macros are rejected, because those depend on the individual message.
 - **Exclusions:** `-`/`~`/`?` terms inside included records are dropped rather than kept as exclusions.
@@ -221,13 +223,15 @@ A token's role on a zone is the highest role among its matching grants:
 TOKEN=$(cargo run -q -p control-plane -- create-token --name ops-admin --admin)
 ```
 
+Admin tokens always expire: after 90 days unless you pass `--expires-in-days N` (1–365).
+
 The same command creates scoped tokens, such as one for DNS nodes (read-only, every zone):
 
 ```bash
 cargo run -q -p control-plane -- create-token --name dns-nodes --grant '*:viewer'
 ```
 
-To register a value you already have, which suits configuration management, add `--secret-env VAR` to read it from an environment variable. (`--secret VALUE` also works, but the value shows up in `ps` and shell history.) A supplied secret must be at least 32 characters and about 128 bits strong, estimated as length × log2(distinct characters). So `aaaa…` is refused; `openssl rand -hex 32` makes a good one. Add `--if-missing` to make the command safe to re-run.
+To register a value you already have, which suits configuration management, add `--secret-env VAR` to read it from an environment variable. (`--secret VALUE` also works, but the value shows up in `ps` and shell history.) A supplied secret must be hex or base64 of at least 32 random bytes (43 or more characters), with no counting or repeating runs; `openssl rand -hex 32` makes a good one. The check refuses obvious patterns, but it can't prove a value is random. Add `--if-missing` to make the command safe to re-run: it leaves a working token alone, and renews one that has expired (with the secret and grants given) but not one that was revoked.
 
 **Managing tokens over the API** (admin only):
 - `POST /tokens` with `{"name", "admin", "grants": [{"pattern", "role", "scripts"}], "expires_in_days"}` returns the secret once. These tokens expire after 90 days by default, and `expires_in_days` can be 1–365.
@@ -237,7 +241,9 @@ To register a value you already have, which suits configuration management, add 
 
 **Token lifetimes:**
 - Tokens minted through the API are for people and MCP clients, so they always expire.
-- Tokens minted with `create-token`, such as the DNS nodes', don't, because an expired node token would take every zone down once its SOA EXPIRE passes.
+- Admin tokens minted with `create-token` always expire too (90 days by default).
+- Other tokens minted with `create-token`, such as the DNS nodes', don't unless you pass `--expires-in-days`, because an expired node token would take every zone down once its SOA EXPIRE passes.
+- `GET /metrics` on the control plane serves `control_plane_auth_failures_total`, the number of requests refused with 401, to any valid token. Give the scraper a token with no grants, and alert on a rising rate.
 - Expiry limits how long a *leaked* token stays useful (one left in a config file, shell history or logs). It isn't about brute force: a generated token is 256 random bits, which can't be guessed at any lifetime.
 - To replace a token, mint a new one, switch clients to it, then revoke the old one.
 
@@ -265,6 +271,8 @@ Node flags for running in production:
 | `--rrl-slip N` | 2 | Send every Nth rate-limited response truncated instead of dropping it (0 = drop all) |
 | `COOKIE_SECRET` (env) | random | 32 hex digits. Give every node behind one anycast address the same secret. `--cookie-secret HEX` also works, but flags show up in `ps`. |
 | `--map-size-mb N` | 1024 | LMDB map size. If the data outgrows it, writes fail and the node stops following, so watch `dns_follow_errors_total`. |
+
+`/metrics` and `/health` need no login, so keep `--http` on loopback or a management network; the node warns at startup otherwise. Their responses are reused for a second.
 
 **Health:** `GET /health` returns 200 while the node serves at least one zone that hasn't expired, and 503 otherwise. The JSON body includes zone counts, `applied_seq` and the time since the last sync.
 
@@ -347,6 +355,7 @@ A Cargo workspace with three crates:
   - `src/main.rs`: JSON-RPC handling, tool definitions, HTTP calls
   - `tests/mcp.rs`: drives the binary over stdio against a real control plane
 - `scripts/multinode-test.sh`: Docker end-to-end test: propagation, expiry, recovery
+- `.github/`: CI (format check, clippy, tests, `cargo audit`, also run weekly) and Dependabot updates for crates, images and actions
 - `Dockerfile`, `docker-compose.yml`: one image with both binaries; the `multinode` compose profile runs the control plane plus two DNS nodes. Containers run as an unprivileged user, so nodes listen on 5300 inside the container; map host port 53 to it.
 
 ## Running
@@ -425,6 +434,7 @@ curl -X POST localhost:8053/zones/example.com/changes -H "authorization: Bearer 
 | `GET` | `/changelog?after=SEQ&limit=N` | Changelog entries after `SEQ`, oldest first, for zones the token can see. Each has an `actor`; continue from `next_after`. |
 | `PUT`, `GET`, `DELETE` | `/zones/{zone}/spf/{name}` | Managed SPF policy: `{"senders": [...], "qualifier"}` (see [Managed SPF](#managed-spf)) |
 | `GET` | `/whoami` | The calling token's name and grants |
+| `GET` | `/metrics` | Prometheus metrics (`control_plane_auth_failures_total`), for any valid token |
 | `POST`, `GET`, `DELETE` | `/tokens`, `/tokens/{name}` | Token management (admin) |
 
 Names may be `@` (the zone apex), relative (`www`), or absolute (`www.example.com.`). Names inside record data (CNAME, MX and NS targets) must be absolute.
