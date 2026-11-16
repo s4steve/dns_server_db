@@ -27,7 +27,7 @@ jobs:
     env:
       DATABASE_URL: postgres://dns:dns@127.0.0.1:5432/dns
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
       - run: cargo fmt --all --check
       # Not -D warnings yet: the tree has some long-standing clippy style warnings.
@@ -37,6 +37,6 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo install cargo-audit --locked
       - run: cargo audit
