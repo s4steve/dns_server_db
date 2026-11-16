@@ -76,10 +76,11 @@ Answers that don't come from a script carry ECS scope 0, so resolvers can cache 
 - The shared libraries are read-only.
 - No `io`, `os`, `require`, `load`, `debug`, `ffi` or `pcall`, and source text only (never precompiled bytecode).
 - Scripts are at most 16 KiB, and `string.rep` builds at most 64 KiB.
-- Each call has a budget of 200k instructions, and each state has a 64 MiB memory limit. Where LuaJIT won't use mlua's allocator (e.g. aarch64 Linux), the limit is checked every 100 instructions, so a single C call (such as a huge concatenation) can briefly overshoot it.
+- Each call has a budget of 200k instructions, and each state has a 64 MiB memory limit. Where LuaJIT won't use mlua's allocator (e.g. aarch64 Linux), the limit is checked after every instruction instead. A single instruction (such as one huge concatenation) can still overshoot it there, by up to LuaJIT's 2 GiB string cap, so give such nodes a container memory limit.
 - Each call also has a 100 ms wall-clock limit, which covers time spent inside C functions such as pattern matching, where the instruction budget can't reach.
-  - A script that exceeds it is disabled on that node until the node restarts or the script changes, and `dns_lua_timeouts_total` counts it.
-  - The runner thread stuck in it is abandoned and replaced, so a query thread is never held longer than the limit.
+  - A script that exceeds it is turned off on that node while the call is still running, and for 60 seconds after it returns. `dns_lua_timeouts_total` counts it. A healthy script that missed the limit on an overloaded node comes back by itself.
+  - The runner thread stuck in the call is abandoned and replaced, so a query thread is never held longer than the limit. On Linux the abandoned thread drops to the lowest priority.
+  - `dns_lua_stuck_runners` counts abandoned calls that haven't returned. At 4, the node stops running scripts (static answers, or SERVFAIL where there are none) until some return or it restarts. Alert on this gauge being above 0.
 - Scripts still run code on every node, so grant `scripts` only to tokens you'd trust with the nodes themselves.
 - LuaJIT's JIT compiler is off. The instruction budget can't interrupt JIT-compiled code, so a runaway loop could otherwise never be stopped.
 
@@ -260,7 +261,7 @@ Node flags for running in production:
 | Flag | Default | Purpose |
 |---|---|---|
 | `--http ADDR` | off | Serves `/metrics` (Prometheus) and `/health` |
-| `--rrl-rps N` | off | Response rate limit: identical responses per second per client network |
+| `--rrl-rps N` | 20 | Response rate limit: identical responses per second per client network (0 = off) |
 | `--rrl-slip N` | 2 | Send every Nth rate-limited response truncated instead of dropping it (0 = drop all) |
 | `COOKIE_SECRET` (env) | random | 32 hex digits. Give every node behind one anycast address the same secret. `--cookie-secret HEX` also works, but flags show up in `ps`. |
 | `--map-size-mb N` | 1024 | LMDB map size. If the data outgrows it, writes fail and the node stops following, so watch `dns_follow_errors_total`. |
@@ -280,7 +281,7 @@ process dns-health {
 - `dns_queries_total{transport,rcode}`
 - `dns_query_duration_seconds`: a histogram of the time spent building each answer
 - truncations, RRL drops and slips, valid cookies
-- Lua runs, errors and timeouts
+- Lua runs, errors and timeouts, and the `dns_lua_stuck_runners` gauge
 - follower errors and REFRESH repairs
 - gauges: `dns_zones`, `dns_zones_expired`, `dns_healthy`, `dns_follow_applied_seq`, `dns_follow_sync_age_seconds`
 
@@ -291,7 +292,9 @@ process dns-health {
 - TCP queries and clients presenting a valid server cookie are never limited.
 - ANY queries over UDP always get a truncated answer (RFC 8482), so they can't be used for amplification. Over TCP they're answered in full.
 
-**TCP:** a connection that sends no complete query for 10 seconds is closed, and a node holds at most 1024 TCP connections.
+**TCP:**
+- A connection is closed if it sends no complete query for 10 seconds, if the client stops reading for 10 seconds, or after 120 seconds in any case.
+- A node holds at most 1024 TCP connections, and at most 32 from one client network (IPv4 /24, IPv6 /56).
 
 **DNS cookies** follow RFC 7873, with RFC 9018 server cookies (SipHash-2-4 with a timestamp, valid for an hour). Cookies are optional: a missing or invalid server cookie gets a fresh cookie and a normal answer. A malformed cookie option gets FORMERR.
 
@@ -310,6 +313,12 @@ With more client threads, throughput levels off around 71–78k QPS on macOS, be
 
 ```bash
 cargo run --release -p dns-server --example loadgen -- 127.0.0.1:5300 10 4 www.example.com/A
+```
+
+Start the node with `--rrl-rps 0` for this, or rate limiting drops most of the load generator's queries:
+
+```bash
+cargo run --release -p dns-server -- serve ./db --rrl-rps 0
 ```
 
 ## Layout
@@ -374,10 +383,20 @@ DNS nodes (`--follow`) and the MCP server enforce this:
 - Certificates are checked against the public web PKI roots, so the proxy needs a publicly trusted certificate.
 
 **Limits:**
-- 64 requests at once; beyond that, requests get 503.
+- 64 requests at once; beyond that, requests get 503. `GET /changelog` and `GET /zones`, which DNS nodes poll, have 64 slots of their own, so other traffic can't lock the nodes out.
 - 30 seconds per request.
 - 1000 changes per changeset.
-- 20 seconds to resolve an SPF policy's senders.
+- 20 seconds to resolve an SPF policy's senders, and 4 policies resolving at once (a fifth `PUT` gets 503).
+
+**Zone quotas** keep one zone from filling the nodes' stores. A change that adds records is refused once the zone would pass one; deletes always work. Override them with environment variables:
+
+| Variable | Default | Limit |
+|---|---|---|
+| `ZONE_MAX_NAMES` | 100000 | Names with records in a zone |
+| `ZONE_MAX_BYTES` | 33554432 (32 MiB) | Names plus record data in a zone |
+| `ZONE_MAX_SPF_POLICIES` | 10000 | Managed SPF policies in a zone |
+
+Size the nodes' `--map-size-mb` for the zones you host: the default 1024 MiB holds roughly 30 zones at the default byte quota.
 
 ```bash
 cargo run -p control-plane

@@ -25,16 +25,18 @@
 //!
 //! The wall-clock limit covers what the instruction budget can't: time spent inside C
 //! functions (pattern matching, big concatenations). A script that exceeds it is disabled on
-//! this node, and its runner thread is abandoned and replaced, so a hung script never holds a
-//! query thread for longer than the limit.
+//! this node while that call is still running and for a cooldown afterwards, and its runner
+//! thread is abandoned and replaced, so a hung script never holds a query thread for longer
+//! than the limit. Abandoned runners are counted: past a cap, the node stops running scripts.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{LazyLock, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use hickory_proto::rr::rdata::NULL;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -82,6 +84,15 @@ pub fn decode_lua(r: &Record) -> Option<(RecordType, &str)> {
 /// so this is well under a millisecond for any script that stays within it.
 const INSTRUCTION_BUDGET: u64 = 200_000;
 const HOOK_EVERY: u32 = 100;
+/// A script that hit the time limit stays off this long after its call returns. Under heavy
+/// load a healthy script can miss the limit; this lets it come back by itself.
+const COOLDOWN: Duration = Duration::from_secs(60);
+/// Abandoned runners still inside a call. At this many the node stops running scripts, so
+/// hung scripts can't keep taking threads.
+// ponytail: calls already in flight when a script first hangs can each strand a runner, so
+// one burst can pass the cap (by up to the worker count). A killable child process is the
+// upgrade if that matters.
+pub const MAX_STUCK: i64 = 4;
 const MEMORY_LIMIT: usize = 64 << 20; // per worker thread
 /// Largest string `string.rep` may build. It runs in C, where the instruction budget can't stop it.
 const MAX_REP_BYTES: usize = 64 * 1024;
@@ -123,15 +134,50 @@ struct Engine {
 struct Runner {
     jobs: mpsc::Sender<(String, Input)>,
     results: mpsc::Receiver<Outcome>,
+    /// Decides the race between "the call finished" and "the caller gave up".
+    state: Arc<AtomicU8>,
+    /// The runner's OS thread ID (Linux), so an abandoned one can be deprioritised.
+    tid: Arc<AtomicI32>,
+}
+
+const RUNNING: u8 = 0;
+const DONE: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// Why a script is off: calls of it still stuck in abandoned runners, and a cooldown.
+struct Strike {
+    stuck: usize,
+    until: Instant,
+}
+
+/// Abandoned runners that are still inside a call (`dns_lua_stuck_runners`).
+pub static STUCK: AtomicI64 = AtomicI64::new(0);
+
+/// Lets an abandoned runner have only CPU nobody else wants, so a call that never returns
+/// can't slow the query threads down.
+fn deprioritise(_tid: i32) {
+    // SAFETY: setpriority only reads its arguments. On Linux, PRIO_PROCESS with a thread ID
+    // sets that one thread's nice value, and raising it needs no privilege.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, _tid as libc::id_t, 19);
+    }
 }
 
 impl Runner {
     fn spawn() -> std::io::Result<Runner> {
         let (jobs, job_rx) = mpsc::channel::<(String, Input)>();
         let (result_tx, results) = mpsc::channel();
+        let state = Arc::new(AtomicU8::new(DONE));
+        let tid = Arc::new(AtomicI32::new(0));
+        let (thread_state, thread_tid) = (state.clone(), tid.clone());
         std::thread::Builder::new()
             .name("lua".into())
             .spawn(move || {
+                #[cfg(target_os = "linux")]
+                // SAFETY: gettid takes no arguments and can't fail.
+                thread_tid.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, SeqCst);
+                let _ = &thread_tid;
                 let mut engine = Engine::new();
                 for (source, input) in job_rx {
                     let outcome = match &mut engine {
@@ -140,12 +186,27 @@ impl Runner {
                             .unwrap_or_else(|e| Outcome::Error(e.to_string())),
                         Err(e) => Outcome::Error(format!("starting Lua: {e}")),
                     };
+                    if thread_state.swap(DONE, SeqCst) == ABANDONED {
+                        // The caller gave up on this call, which has now returned after all.
+                        // Taking the lock orders this after the caller's own bookkeeping.
+                        let mut off = DISABLED.write().unwrap_or_else(PoisonError::into_inner);
+                        STUCK.fetch_sub(1, SeqCst);
+                        if let Some(strike) = off.get_mut(&source) {
+                            strike.stuck -= 1;
+                        }
+                        break;
+                    }
                     if result_tx.send(outcome).is_err() {
-                        break; // timed out and replaced: nobody is waiting
+                        break;
                     }
                 }
             })?;
-        Ok(Runner { jobs, results })
+        Ok(Runner {
+            jobs,
+            results,
+            state,
+            tid,
+        })
     }
 }
 
@@ -153,17 +214,21 @@ thread_local! {
     static RUNNER: RefCell<Option<Runner>> = const { RefCell::new(None) };
 }
 
-/// Scripts that exceeded the time limit; they fail fast here until the node restarts or the
-/// script changes. Each one leaked at most one stuck runner thread, which bounds the leak.
-static DISABLED: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(Default::default);
+/// Scripts that exceeded the time limit. They fail fast here while a call of theirs is still
+/// stuck, and until the cooldown ends.
+static DISABLED: LazyLock<RwLock<HashMap<String, Strike>>> = LazyLock::new(Default::default);
 
 pub fn run(source: &str, input: &Input) -> Outcome {
+    if STUCK.load(SeqCst) >= MAX_STUCK {
+        return Outcome::Error("scripts are off on this node: too many calls are stuck".into());
+    }
     // The read guard is a temporary of the condition, so it's released before the call
     // below, which may need the write lock.
     if DISABLED
         .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(source)
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(source)
+        .is_some_and(|s| s.stuck > 0 || Instant::now() < s.until)
     {
         return Outcome::Error("disabled on this node after exceeding the time limit".into());
     }
@@ -176,6 +241,7 @@ pub fn run(source: &str, input: &Input) -> Outcome {
             }
         }
         let runner = slot.as_ref().unwrap();
+        runner.state.store(RUNNING, SeqCst);
         if runner
             .jobs
             .send((source.to_string(), input.clone()))
@@ -187,13 +253,33 @@ pub fn run(source: &str, input: &Input) -> Outcome {
         match runner.results.recv_timeout(TIME_LIMIT) {
             Ok(outcome) => outcome,
             Err(RecvTimeoutError::Timeout) => {
-                // Abandon the stuck runner (it exits if the call ever returns) and disable the
-                // script so it can't strand another one.
+                let mut off = DISABLED.write().unwrap_or_else(PoisonError::into_inner);
+                if runner
+                    .state
+                    .compare_exchange(RUNNING, ABANDONED, SeqCst, SeqCst)
+                    .is_err()
+                {
+                    // It finished just as the limit passed: its result is on the way.
+                    drop(off);
+                    return runner
+                        .results
+                        .recv_timeout(TIME_LIMIT)
+                        .unwrap_or_else(|_| Outcome::Error("script thread exited".into()));
+                }
+                // Abandon the runner (it exits when the call returns, if ever) and turn the
+                // script off so it can't strand another one.
+                let now = Instant::now();
+                off.retain(|_, s| s.stuck > 0 || now < s.until);
+                let strike = off.entry(source.to_string()).or_insert(Strike {
+                    stuck: 0,
+                    until: now,
+                });
+                strike.stuck += 1;
+                strike.until = now + COOLDOWN;
+                STUCK.fetch_add(1, SeqCst);
+                drop(off);
+                deprioritise(runner.tid.load(SeqCst));
                 *slot = None;
-                DISABLED
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(source.to_string());
                 crate::metrics::inc(&crate::metrics::LUA_TIMEOUTS);
                 Outcome::Error(format!(
                     "exceeded the {}ms time limit; disabled on this node",
@@ -219,11 +305,13 @@ impl Engine {
         // ponytail: JIT off for safety. Revisit with a watchdog if scripts become CPU-heavy.
         lua.load("jit.off()").exec()?;
         // A hard limit needs mlua's allocator, which LuaJIT refuses where heap addresses exceed
-        // 47 bits (e.g. aarch64 Linux). Then the hook checks the GC's count instead.
-        // ponytail: the soft check runs every HOOK_EVERY instructions, so one C call (e.g.
-        // repeated `..`) can briefly overshoot, up to LuaJIT's 2 GiB string cap. A separate
-        // script process with an rlimit is the upgrade if that matters.
+        // 47 bits (e.g. aarch64 Linux). Then the hook checks the GC's count instead, after
+        // every instruction, so growth across instructions is caught at once.
+        // ponytail: a single instruction can still allocate past the limit (one big
+        // concatenation, up to LuaJIT's 2 GiB string cap). A separate script process with an
+        // rlimit is the upgrade if that matters.
         let hard_limit = lua.set_memory_limit(MEMORY_LIMIT).is_ok();
+        let hook_every = if hard_limit { HOOK_EVERY } else { 1 };
 
         let globals = lua.globals();
         // Replaced in the real string table, so `("x"):rep(n)` method calls are capped too.
@@ -279,12 +367,12 @@ impl Engine {
         let instructions = Rc::new(Cell::new(0));
         let counter = instructions.clone();
         lua.set_hook(
-            HookTriggers::new().every_nth_instruction(HOOK_EVERY),
+            HookTriggers::new().every_nth_instruction(hook_every),
             move |lua, _| {
                 if !hard_limit && lua.used_memory() > MEMORY_LIMIT {
                     return Err(mlua::Error::runtime("memory limit exceeded"));
                 }
-                counter.set(counter.get() + u64::from(HOOK_EVERY));
+                counter.set(counter.get() + u64::from(hook_every));
                 if counter.get() > INSTRUCTION_BUDGET {
                     return Err(mlua::Error::runtime("instruction budget exceeded"));
                 }
@@ -400,14 +488,60 @@ mod tests {
         let i = input();
         // Backtracking pattern matching runs in C, where the instruction budget never fires.
         let stuck = "local s = ('a'):rep(60000) return s:find('.-.-.-.-.-.-b')";
+        run("return 'ok'", &i); // start this thread's runner, to learn its thread ID
+        let tid = RUNNER.with(|r| r.borrow().as_ref().unwrap().tid.load(SeqCst));
         let t = std::time::Instant::now();
         assert!(matches!(run(stuck, &i), Outcome::Error(e) if e.contains("time limit")));
+        // On Linux the abandoned runner now has the lowest priority (nice 19).
+        if cfg!(target_os = "linux") {
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
+            let nice = stat
+                .rsplit_once(") ")
+                .unwrap()
+                .1
+                .split(' ')
+                .nth(16)
+                .unwrap();
+            assert_eq!(nice, "19", "{stat}");
+        }
         assert!(t.elapsed() < TIME_LIMIT * 5, "took {:?}", t.elapsed());
         // Disabled from now on, without running; other scripts still run on a fresh runner.
         let t = std::time::Instant::now();
         assert!(matches!(run(stuck, &i), Outcome::Error(e) if e.contains("disabled")));
         assert!(t.elapsed() < TIME_LIMIT);
         assert_eq!(run("return 'ok'", &i), Outcome::Answer(vec!["ok".into()]));
+        assert_eq!(STUCK.load(SeqCst), 1);
+
+        // A script that is only slow: abandoned too, but its call returns, so it stops
+        // counting as stuck. It stays off for the cooldown.
+        let slow = "local s = ('a'):rep(900) return tostring(s:find('^.-.-.-b'))";
+        assert!(matches!(run(slow, &i), Outcome::Error(e) if e.contains("time limit")));
+        let t = std::time::Instant::now();
+        while STUCK.load(SeqCst) > 1 {
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "slow script never returned"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let off = DISABLED.read().unwrap();
+        assert_eq!((off[stuck].stuck, off[slow].stuck), (1, 0));
+        assert!(Instant::now() < off[slow].until);
+    }
+
+    /// Leaves MAX_STUCK threads spinning, so it runs alone:
+    /// `cargo test -p dns-server -- --ignored stuck_cap`
+    #[test]
+    #[ignore]
+    fn stuck_cap_turns_scripts_off() {
+        let i = input();
+        for n in 0..MAX_STUCK {
+            let stuck = format!("local s = ('a'):rep(6000{n}) return s:find('.-.-.-.-.-.-b')");
+            assert!(matches!(run(&stuck, &i), Outcome::Error(e) if e.contains("time limit")));
+        }
+        assert!(
+            matches!(run("return 'ok'", &i), Outcome::Error(e) if e.contains("scripts are off"))
+        );
     }
 
     #[test]

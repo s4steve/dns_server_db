@@ -28,8 +28,12 @@ const PLAIN_UDP_LIMIT: u16 = 512;
 const COOKIE: u16 = 10; // EDNS option code (RFC 7873)
 /// A TCP connection that sends no complete query for this long is closed (RFC 7766 §6.2.3).
 const TCP_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
-// ponytail: fixed cap; make it a flag if a node legitimately needs more concurrent TCP clients.
+// ponytail: fixed caps; make them flags if a node legitimately needs more concurrent TCP clients.
 const MAX_TCP_CONNS: usize = 1024;
+/// Connections one client network (IPv4 /24, IPv6 /56) may hold, so it can't take them all.
+const MAX_TCP_CONNS_PER_BLOCK: usize = 32;
+/// A connection is closed after this long however busy it is; clients reconnect (RFC 7766).
+const TCP_LIFETIME: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -269,8 +273,53 @@ async fn serve_tcp_conn(srv: Arc<Server>, mut stream: TcpStream) -> std::io::Res
         let Some(resp) = handle(&srv, &buf, Transport::Tcp, peer) else {
             return Ok(());
         };
-        stream.write_u16(resp.len() as u16).await?;
-        stream.write_all(&resp).await?;
+        let write = async {
+            stream.write_u16(resp.len() as u16).await?;
+            stream.write_all(&resp).await
+        };
+        // A client that stops reading must not hold the connection open.
+        let Ok(written) = tokio::time::timeout(TCP_IDLE, write).await else {
+            return Ok(());
+        };
+        written?;
+    }
+}
+
+/// Open TCP connections per client network. `enter` returns None when the network is at its
+/// cap; dropping the guard gives the place back.
+#[derive(Default)]
+struct TcpBlocks(std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>);
+
+struct TcpPlace(Arc<TcpBlocks>, IpAddr);
+
+impl TcpBlocks {
+    fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<TcpPlace> {
+        let block = rrl::block(peer);
+        let mut open = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = open.entry(block).or_insert(0);
+        if *count >= MAX_TCP_CONNS_PER_BLOCK {
+            return None;
+        }
+        *count += 1;
+        Some(TcpPlace(self.clone(), block))
+    }
+}
+
+impl Drop for TcpPlace {
+    fn drop(&mut self) {
+        let mut open = (self.0)
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.1);
+            }
+        }
     }
 }
 
@@ -285,10 +334,11 @@ async fn serve(srv: Arc<Server>, addr: &str) -> std::io::Result<()> {
         tokio::spawn(serve_udp(srv.clone(), udp.clone()));
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNS));
+    let blocks = Arc::new(TcpBlocks::default());
     loop {
         // Accept errors (e.g. out of file descriptors) are transient: never exit the server.
-        let stream = match tcp.accept().await {
-            Ok((stream, _)) => stream,
+        let (stream, peer) = match tcp.accept().await {
+            Ok(accepted) => accepted,
             Err(e) => {
                 warn(format_args!("tcp accept: {e}"));
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -298,10 +348,13 @@ async fn serve(srv: Arc<Server>, addr: &str) -> std::io::Result<()> {
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             continue; // at capacity: drop the connection
         };
+        let Some(place) = blocks.enter(peer.ip()) else {
+            continue; // this client network has its share already
+        };
         let srv = srv.clone();
         tokio::spawn(async move {
-            let _ = serve_tcp_conn(srv, stream).await;
-            drop(slot);
+            let _ = tokio::time::timeout(TCP_LIFETIME, serve_tcp_conn(srv, stream)).await;
+            drop((slot, place));
         });
     }
 }
@@ -329,7 +382,8 @@ const USAGE: &str = "usage:
   --poll-ms N           changelog poll interval (default 1000)
   --node-id ID          this node's name, visible to LUA scripts as q.node (default: $HOSTNAME)
   --http ADDR           serve /metrics (Prometheus) and /health here (default: off)
-  --rrl-rps N           response rate limit per client block and response (default: off)
+  --rrl-rps N           response rate limit per client block and response (default 20;
+                        0 = off)
   --rrl-slip N          send every Nth limited response truncated instead of dropping it
                         (default 2; 0 = drop all)
   --cookie-secret HEX   32 hex digits; share it across anycast nodes (default: random).
@@ -384,7 +438,7 @@ async fn main() -> store::Result<()> {
         ["serve", db, ref flags @ ..] => {
             let (mut listen, mut follow, mut poll_ms, mut http) =
                 ("127.0.0.1:5300", None, 1000, None);
-            let (mut rrl_rps, mut rrl_slip, mut secret) = (0u32, 2u32, None);
+            let (mut rrl_rps, mut rrl_slip, mut secret) = (20u32, 2u32, None);
             let mut map_size = store::MAP_SIZE;
             let num = |v: &str| -> u64 { v.parse().unwrap_or_else(|_| usage()) };
             for pair in flags.chunks(2) {
@@ -556,6 +610,23 @@ mod tests {
             assert!(check_transport(bad, false).is_err(), "{bad}");
         }
         assert!(check_transport("http://control-plane:8053", true).is_ok());
+    }
+
+    #[test]
+    fn tcp_connections_are_capped_per_client_network() {
+        let blocks = Arc::new(TcpBlocks::default());
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut held: Vec<TcpPlace> = (0..MAX_TCP_CONNS_PER_BLOCK)
+            .map(|i| blocks.enter(ip(&format!("192.0.2.{i}"))).unwrap())
+            .collect();
+        // The same /24 is full; other networks aren't affected.
+        assert!(blocks.enter(ip("192.0.2.200")).is_none());
+        assert!(blocks.enter(ip("198.51.100.1")).is_some());
+        // Closing a connection frees its place, and empty networks are forgotten.
+        held.pop();
+        held.push(blocks.enter(ip("192.0.2.200")).unwrap());
+        drop(held);
+        assert!(blocks.0.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -28,6 +28,14 @@ const SHARDS: usize = 64;
 // sources at modest scale; switch to a fixed-size table if memory under attack matters.
 const MAX_BUCKETS_PER_SHARD: usize = 16_384;
 
+/// The client network an address counts against: IPv4 /24, IPv6 /56.
+pub fn block(client: IpAddr) -> IpAddr {
+    match client {
+        IpAddr::V4(ip) => IpAddr::V4((u32::from(ip) & 0xffff_ff00).into()),
+        IpAddr::V6(ip) => IpAddr::V6((u128::from(ip) & !((1u128 << 72) - 1)).into()),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
     Send,
@@ -78,10 +86,7 @@ impl Rrl {
         now: Instant,
     ) -> Verdict {
         let mut h = self.hasher.build_hasher();
-        match client {
-            IpAddr::V4(ip) => (u32::from(ip) & 0xffff_ff00).hash(&mut h),
-            IpAddr::V6(ip) => (u128::from(ip) & !((1u128 << 72) - 1)).hash(&mut h),
-        }
+        block(client).hash(&mut h);
         u16::from(rcode).hash(&mut h);
         if matches!(rcode, ResponseCode::NoError | ResponseCode::NXDomain) {
             name.to_lowercase().hash(&mut h);

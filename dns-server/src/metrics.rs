@@ -169,7 +169,7 @@ pub fn render(store: &Store) -> String {
         ),
         (
             "dns_lua_timeouts_total",
-            "LUA scripts that exceeded the time limit and were disabled on this node.",
+            "LUA calls that exceeded the time limit; the script is turned off for a while.",
             &LUA_TIMEOUTS,
         ),
         (
@@ -189,6 +189,13 @@ pub fn render(store: &Store) -> String {
             get(counter)
         );
     }
+
+    let _ = writeln!(
+        o,
+        "# HELP dns_lua_stuck_runners Abandoned LUA calls still running; scripts stop at {}.\n# TYPE dns_lua_stuck_runners gauge\ndns_lua_stuck_runners {}",
+        crate::script::MAX_STUCK,
+        crate::script::STUCK.load(Relaxed)
+    );
 
     if let Ok(h) = health(store) {
         let gauges = [

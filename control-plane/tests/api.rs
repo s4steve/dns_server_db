@@ -50,6 +50,16 @@ fn unique(prefix: &str) -> String {
 
 /// Connects, and mints a fresh admin token to call with.
 async fn app() -> Api {
+    // Small zone quotas, set before the API first reads them, so `quotas` can reach them.
+    static QUOTAS: std::sync::Once = std::sync::Once::new();
+    QUOTAS.call_once(|| {
+        // SAFETY: runs once, before any request handler (the only reader) exists.
+        unsafe {
+            std::env::set_var("ZONE_MAX_NAMES", "500");
+            std::env::set_var("ZONE_MAX_BYTES", "1000000");
+            std::env::set_var("ZONE_MAX_SPF_POLICIES", "3");
+        }
+    });
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://dns:dns@127.0.0.1:5432/dns".into());
     let pool = control_plane::connect(&url).await.unwrap_or_else(|e| {
@@ -810,5 +820,83 @@ async fn managed_spf() {
     assert_eq!(
         call(&editor, "GET", &policy, None).await.0,
         StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn quotas() {
+    let admin = app().await;
+    let zone = format!("{}.test", unique("quota"));
+    let changes = format!("/zones/{zone}/changes");
+    let (status, body) = call(
+        &admin,
+        "POST",
+        "/zones",
+        Some(json!({ "name": zone, "ns": ["ns1.example.net."] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Names: 400 fit, 200 more don't (the test limit is 500), and nothing is half-applied.
+    let names = |range: std::ops::Range<u32>| -> Value {
+        let adds: Vec<Value> = range
+            .map(|i| add(&format!("n{i}"), "A", "192.0.2.1"))
+            .collect();
+        json!({ "changes": adds })
+    };
+    let (status, body) = call(&admin, "POST", &changes, Some(names(0..400))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&admin, "POST", &changes, Some(names(400..600))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(errors(&body).contains("names; the limit is 500"), "{body}");
+    // Deleting still works at the limit, and frees room.
+    let delete = json!({ "changes": [{ "action": "delete", "name": "n0", "type": "A" }] });
+    let (status, body) = call(&admin, "POST", &changes, Some(delete)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Bytes: 30 names of about 50 KB each pass the test limit of 1 MB.
+    let big = vec![format!("\"{}\"", "x".repeat(250)); 200].join(" ");
+    let adds: Vec<Value> = (0..30)
+        .map(|i| add(&format!("big{i}"), "TXT", &big))
+        .collect();
+    let (status, body) = call(&admin, "POST", &changes, Some(json!({ "changes": adds }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(errors(&body).contains("bytes of records"), "{body}");
+
+    // SPF policies: three fit, a fourth doesn't, and replacing an existing one still works.
+    let policy = json!({ "senders": ["192.0.2.0/24"] });
+    for i in 0..3 {
+        let (status, body) = call(
+            &admin,
+            "PUT",
+            &format!("/zones/{zone}/spf/p{i}"),
+            Some(policy.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = call(
+        &admin,
+        "PUT",
+        &format!("/zones/{zone}/spf/p3"),
+        Some(policy.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(errors(&body).contains("SPF policies"), "{body}");
+    let (status, body) = call(
+        &admin,
+        "PUT",
+        &format!("/zones/{zone}/spf/p0"),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        call(&admin, "DELETE", &format!("/zones/{zone}"), None)
+            .await
+            .0,
+        StatusCode::OK
     );
 }

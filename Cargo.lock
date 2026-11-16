@@ -447,6 +447,7 @@ dependencies = [
  "axum",
  "heed",
  "hickory-proto",
+ "libc",
  "mlua",
  "serde",
  "serde_json",

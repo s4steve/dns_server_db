@@ -28,6 +28,37 @@ const MAX_CHANGES: usize = 1000;
 // in front of this; slow request headers are also the proxy's job.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_REQUESTS: usize = 64;
+/// SPF policies being resolved at once. Each can take 20 s of outside DNS, so they get their
+/// own small limit and can't fill the request slots.
+const MAX_SPF_RESOLVING: usize = 4;
+
+/// Per-zone size limits, so one zone can't fill the nodes' stores (which would stop
+/// replication for every zone). Each can be overridden by the environment variable named.
+struct Quotas {
+    /// ZONE_MAX_NAMES
+    names: i64,
+    /// ZONE_MAX_BYTES: names and record data, plus a little per record
+    bytes: i64,
+    /// ZONE_MAX_SPF_POLICIES
+    spf_policies: i64,
+}
+
+fn quotas() -> &'static Quotas {
+    static QUOTAS: std::sync::OnceLock<Quotas> = std::sync::OnceLock::new();
+    QUOTAS.get_or_init(|| {
+        let env = |name: &str, default: i64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        Quotas {
+            names: env("ZONE_MAX_NAMES", 100_000),
+            bytes: env("ZONE_MAX_BYTES", 32 << 20),
+            spf_policies: env("ZONE_MAX_SPF_POLICIES", 10_000),
+        }
+    })
+}
 
 pub fn router(pool: PgPool) -> Router {
     Router::new()
@@ -51,9 +82,17 @@ pub fn router(pool: PgPool) -> Router {
 
 /// Sheds load past MAX_CONCURRENT_REQUESTS and cuts off requests (body reads included) that
 /// run longer than REQUEST_TIMEOUT. A cut-off request's transaction is rolled back.
+///
+/// The two reads DNS nodes poll have slots of their own: if other requests fill theirs, nodes
+/// can still sync (a node that can't sync stops serving once its zones' EXPIRE passes).
 async fn limits(req: Request, next: Next) -> Response {
     static SLOTS: tokio::sync::Semaphore =
         tokio::sync::Semaphore::const_new(MAX_CONCURRENT_REQUESTS);
+    static POLL_SLOTS: tokio::sync::Semaphore =
+        tokio::sync::Semaphore::const_new(MAX_CONCURRENT_REQUESTS);
+    let polling = req.method() == axum::http::Method::GET
+        && matches!(req.uri().path(), "/changelog" | "/zones");
+    let slots = if polling { &POLL_SLOTS } else { &SLOTS };
     let unavailable = |e: &str| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -61,7 +100,7 @@ async fn limits(req: Request, next: Next) -> Response {
         )
             .into_response()
     };
-    let Ok(_slot) = SLOTS.try_acquire() else {
+    let Ok(_slot) = slots.try_acquire() else {
         return unavailable("too many concurrent requests; retry shortly");
     };
     tokio::time::timeout(REQUEST_TIMEOUT, next.run(req))
@@ -78,6 +117,8 @@ pub enum ApiError {
     Forbidden(String),
     NotFound(String),
     Conflict(String),
+    /// 503: busy right now; retrying later can work.
+    Unavailable(String),
     Internal(String),
 }
 
@@ -97,6 +138,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(e) => (StatusCode::FORBIDDEN, vec![e]),
             ApiError::NotFound(e) => (StatusCode::NOT_FOUND, vec![e]),
             ApiError::Conflict(e) => (StatusCode::CONFLICT, vec![e]),
+            ApiError::Unavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, vec![e]),
             ApiError::Internal(e) => {
                 eprintln!("internal error: {e}");
                 (
@@ -764,6 +806,33 @@ async fn apply_parsed(
         errors.extend(validate::check_name(zone, &owner, &records));
     }
 
+    // Quotas apply only to changes that add, so an over-quota zone can still be trimmed.
+    // ponytail: one aggregate over the zone per changeset; keep running totals on the zone
+    // row if zones near the quota make this slow.
+    if errors.is_empty() && parsed.iter().any(|p| matches!(p, Parsed::Add { .. })) {
+        let (names, bytes): (i64, i64) = sqlx::query_as(
+            "SELECT count(DISTINCT name),
+                    COALESCE(sum(octet_length(name) + octet_length(data) + 16), 0)::bigint
+             FROM records WHERE zone_id = $1",
+        )
+        .bind(row.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let q = quotas();
+        if names > q.names {
+            errors.push(format!(
+                "zone {zone} would have {names} names; the limit is {}",
+                q.names
+            ));
+        }
+        if bytes > q.bytes {
+            errors.push(format!(
+                "zone {zone} would hold {bytes} bytes of records; the limit is {}",
+                q.bytes
+            ));
+        }
+    }
+
     if !errors.is_empty() {
         return Err(ApiError::BadRequest(errors)); // the caller's tx rolls back
     }
@@ -852,7 +921,28 @@ async fn put_spf(
     if req.senders.is_empty() {
         return Err(bad("senders: at least one sender is required"));
     }
-    let terms = spf::flatten_live(&req.senders).await.map_err(bad)?;
+    let others: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM spf_policies p JOIN zones z ON z.id = p.zone_id
+         WHERE z.name = $1 AND p.name <> $2",
+    )
+    .bind(zone.to_string())
+    .bind(name.to_string())
+    .fetch_one(&pool)
+    .await?;
+    if others >= quotas().spf_policies {
+        return Err(bad(format!(
+            "zone {zone} already has {others} SPF policies; the limit is {}",
+            quotas().spf_policies
+        )));
+    }
+    let terms = {
+        static RESOLVING: tokio::sync::Semaphore =
+            tokio::sync::Semaphore::const_new(MAX_SPF_RESOLVING);
+        let _slot = RESOLVING.try_acquire().map_err(|_| {
+            ApiError::Unavailable("other SPF policies are being resolved; retry shortly".into())
+        })?;
+        spf::flatten_live(&req.senders).await.map_err(bad)?
+    };
     let desired = spf::render(&name, &terms, &qualifier).map_err(bad)?;
 
     let mut tx = pool.begin().await?;

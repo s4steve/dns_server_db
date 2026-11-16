@@ -14,4 +14,7 @@ siphasher = "1.0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 ureq = { version = "3.4.2", features = ["json"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
