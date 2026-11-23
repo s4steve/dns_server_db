@@ -8,7 +8,7 @@ x-dev-tokens:
 
 services:
   postgres:
-    image: postgres:17
+    image: postgres:19
     environment:
       POSTGRES_USER: dns
       POSTGRES_PASSWORD: dns # local development only
